@@ -126,6 +126,7 @@ struct Period4 {
 
 #[derive(Debug, Clone)]
 struct Period6 {
+    hour_id: i64,
     day_id: i64,
     datetime: chrono::DateTime<chrono::Utc>,
 }
@@ -916,11 +917,12 @@ impl SolutionDataset {
 
     fn parse_period6(&mut self, node: &Node) -> Result<()> {
         for period_node in node.children().filter(|n| n.has_tag_name("t_period_6")) {
+            let hour_id = get_child(&n, "hour_id")?;
             let day_id = get_child(&period_node, "day_id")?;
             let datetime: String = get_child(&period_node, "datetime")?;
             let datetime = parse_datetime_to_utc(&datetime)?;
-            let period6 = Period6 { day_id, datetime };
-            self.period.entry("hour".to_string()).or_default().insert(period6.day_id, PeriodType::Hour(period6));
+            let period6 = Period6 { hour_id, day_id, datetime };
+            self.period.entry("hour".to_string()).or_default().insert(period6.hour_id, PeriodType::Hour(period6));
         }
         self.period.entry("hour".to_string()).or_default().sort_keys();
         Ok(())
@@ -1093,9 +1095,14 @@ impl SolutionDataset {
                 let period_id = phase_type.period_id();
 
                 for (period_name, extractor) in &extractors {
-                    if let Ok(period) = extractor(self, interval_id) {
+                    let (period_arg, suffix) = match *period_name {
+                        "Interval" => (interval_id, "Interval"),
+                        _ => (period_id, *period_name),
+                    };
+
+                    if let Ok(period) = extractor(self, period_arg) {
                         let datetime = period.datetime();
-                        let key = format!("{}__{}", phase_name, period_name);
+                        let key = format!("{}__{}", phase_name, suffix);
                         self.timestamp_block.entry(key).or_default().push((datetime, period_id));
                     }
                 }
@@ -1783,10 +1790,10 @@ impl SolutionDataset {
                 "
                 CREATE TABLE data.\"{table_name}\" (
                   key_id INTEGER,
-                  sample_id INTEGER, -- dimension 1
-                  band_id INTEGER, -- dimension 2
-                  membership_id INTEGER, -- dimension 3
-                  block_id INTEGER, -- dimension 4
+                  sample_id INTEGER,
+                  band_id INTEGER,
+                  membership_id INTEGER,
+                  block_id INTEGER,
                   value DOUBLE,
                 )
               ",
@@ -1800,9 +1807,9 @@ impl SolutionDataset {
                 let ki = self.key_index(key_id)?;
                 let key = self.key(key_id)?;
 
-                let band_id = key.band_id; // dimension 2
-                let sample_id = key.sample_id; // dimension 3
-                let membership_id = key.membership_id; // dimension 4
+                let band_id = key.band_id;
+                let sample_id = key.sample_id;
+                let membership_id = key.membership_id;
 
                 let start_idx = ki.position;
                 let end_idx = ki.position + 8 * ki.length;
@@ -1812,7 +1819,6 @@ impl SolutionDataset {
                 let data = raw_data.chunks_exact(8).map(TryInto::try_into).map(Result::unwrap).map(f64::from_le_bytes);
                 let period_offset = ki.period_offset as usize;
 
-                // dimension 1 is the enumerated time
                 for (block_id, value) in data.enumerate() {
                     appender.append_row(duckdb::params![
                         key_id,
