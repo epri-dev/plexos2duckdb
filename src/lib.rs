@@ -254,13 +254,16 @@ struct Key {
     timeslice_id: i64,
 }
 
+type PeriodTypeId = i64;
+type KeyId = i64;
+
 #[derive(Debug, Default, Clone)]
 struct KeyIndex {
-    key_id: i64,         // key_id
-    period_type_id: i64, // period_type_id
-    length: usize,       // in 8-byte (64-bit float) increments
-    position: usize,     // bytes from binary file start
-    period_offset: i64,  // temporal data offset (if any) in stored times
+    key_id: KeyId,                // key_id
+    period_type_id: PeriodTypeId, // period_type_id
+    length: usize,                // in 8-byte (64-bit float) increments
+    position: usize,              // bytes from binary file start
+    period_offset: i64,           // temporal data offset (if any) in stored times
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1241,7 +1244,7 @@ impl SolutionDataset {
             "
               CREATE TYPE object_kind AS ENUM ('object', 'relation');
               CREATE TABLE raw.memberships (
-                membership_id INTEGER,
+                membership_id INTEGER PRIMARY KEY,
                 collection_id INTEGER,
                 collection VARCHAR,
                 child_id INTEGER,
@@ -1304,7 +1307,7 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.collections (
-                collection_id INTEGER,
+                collection_id INTEGER PRIMARY KEY,
                 parent_class_id INTEGER,
                 child_class_id INTEGER,
                 name VARCHAR,
@@ -1334,7 +1337,7 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.classes (
-                class_id INTEGER,
+                class_id INTEGER PRIMARY KEY,
                 name VARCHAR,
                 class_group_id INTEGER
               );
@@ -1356,7 +1359,7 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.class_groups (
-                class_group_id INTEGER,
+                class_group_id INTEGER PRIMARY KEY,
                 name VARCHAR
               );
               ",
@@ -1377,7 +1380,7 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.categories (
-                category_id INTEGER,
+                category_id INTEGER PRIMARY KEY,
                 class_id INTEGER,
                 rank INTEGER,
                 name VARCHAR
@@ -1405,7 +1408,7 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.bands (
-                band_id INTEGER
+                band_id INTEGER PRIMARY KEY,
               );
               ",
         )?;
@@ -1425,7 +1428,7 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.models (
-                model_id INTEGER,
+                model_id INTEGER PRIMARY KEY,
                 name VARCHAR
               );
               ",
@@ -1446,7 +1449,7 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.objects (
-                object_id INTEGER,
+                object_id INTEGER PRIMARY KEY,
                 class_id INTEGER,
                 name VARCHAR,
                 category_id INTEGER,
@@ -1478,7 +1481,7 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.keys (
-                key_id INTEGER,
+                key_id BIGINT PRIMARY KEY,
                 membership_id INTEGER,
                 model_id INTEGER,
                 phase_id INTEGER,
@@ -1516,11 +1519,11 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.key_indexes (
-                key_id INTEGER,
-                period_type_id INTEGER,
-                position INTEGER,
-                length INTEGER,
-                period_offset INTEGER
+                key_id BIGINT PRIMARY KEY,
+                period_type_id BIGINT,
+                position UBIGINT,
+                length UBIGINT,
+                period_offset BIGINT,
               );
               ",
         )?;
@@ -1610,11 +1613,10 @@ impl SolutionDataset {
         )?;
         let mut appender = con.appender_to_db("samples", "raw")?;
         for (_, sample) in self.sample.iter() {
-            let sample_weight = self.sample_weight(sample.sample_id).cloned().unwrap_or_else(|_| SampleWeight {
-                sample_id: sample.sample_id,
-                phase_id: 0,
-                weight: 0.0,
-            });
+            let sample_weight = self
+                .sample_weight(sample.sample_id)
+                .cloned()
+                .unwrap_or_else(|_| SampleWeight { sample_id: sample.sample_id, phase_id: 0, weight: 0.0 });
 
             appender.append_row(duckdb::params![
                 sample.sample_id,
@@ -1651,15 +1653,15 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.memo_objects (
-                value VARCHAR,
-                column_id INTEGER,
                 object_id INTEGER,
+                column_id INTEGER,
+                value VARCHAR,
               );
               ",
         )?;
         let mut appender = con.appender_to_db("memo_objects", "raw")?;
         for memo in &self.memo_object {
-            appender.append_row(duckdb::params![memo.value, memo.column_id, memo.object_id])?;
+            appender.append_row(duckdb::params![memo.object_id, memo.column_id, memo.value])?;
         }
         appender.flush()?;
 
@@ -1782,7 +1784,7 @@ impl SolutionDataset {
             con.execute_batch(&format!(
                 "
                 CREATE TABLE data.\"{table_name}\" (
-                  key_id INTEGER,
+                  key_id BIGINT,
                   sample_id INTEGER,
                   band_id INTEGER,
                   membership_id INTEGER,
