@@ -31,7 +31,7 @@ struct Args {
     in_memory: bool,
     /// Number of threads to use when writing time series data tables
     #[arg(long)]
-    data_write_threads: Option<std::num::NonZeroUsize>,
+    n_threads: Option<std::num::NonZeroUsize>,
 }
 
 fn resolve_input_path(input: &std::path::Path) -> Result<std::path::PathBuf> {
@@ -83,8 +83,10 @@ fn run(args: Args) -> Result<()> {
     let mut mp = None;
     let mut pb = None;
     let mut data_tables_pb = None;
+    let mut data_merge_pb = None;
     let mut worker_tables_pb: std::collections::BTreeMap<usize, ProgressBar> = std::collections::BTreeMap::new();
     let mut current_table = None;
+    let mut last_data_table_was_final = false;
     let mut last_msg = String::new();
     let mut start_time = None;
     let mut last_mark = None;
@@ -151,16 +153,18 @@ fn run(args: Args) -> Result<()> {
                 if keys == 0 {
                     return;
                 }
+                last_data_table_was_final = index == total;
                 current_table = Some(table_name);
                 if data_tables_pb.is_none() {
                     if let Some(multi) = mp.as_ref() {
                         let bar = multi.add(ProgressBar::new(total as u64));
                         bar.set_style(
                             ProgressStyle::with_template(
-                                "{bar:40.cyan/blue} {pos:>2}/{len:2} {elapsed_precise:.dim} {msg:.cyan}",
+                                "{prefix:>9.bold} {bar:28.cyan/blue} {pos:>2}/{len:2} {elapsed_precise:.dim} {msg:.cyan}",
                             )
                             .unwrap(),
                         );
+                        bar.set_prefix("tables");
                         data_tables_pb = Some(bar);
                     }
                 }
@@ -173,6 +177,11 @@ fn run(args: Args) -> Result<()> {
             },
             plexos2duckdb::ProgressEvent::DataTableEnd => {
                 current_table = None;
+                if last_data_table_was_final {
+                    if let Some(bar) = data_tables_pb.as_ref() {
+                        bar.set_message("done");
+                    }
+                }
             },
             plexos2duckdb::ProgressEvent::DataWorkerTableStart { worker_id, index, total, table_name, keys } => {
                 if !worker_tables_pb.contains_key(&worker_id) {
@@ -196,6 +205,35 @@ fn run(args: Args) -> Result<()> {
             },
             plexos2duckdb::ProgressEvent::DataWorkerTableEnd { worker_id, index, total } => {
                 if let Some(bar) = worker_tables_pb.get(&worker_id) {
+                    bar.set_length(total as u64);
+                    bar.set_position(index as u64);
+                    if index == total {
+                        bar.set_message("done");
+                    }
+                }
+            },
+            plexos2duckdb::ProgressEvent::DataMergeTableStart { index, total, table_name } => {
+                if data_merge_pb.is_none() {
+                    if let Some(multi) = mp.as_ref() {
+                        let bar = multi.add(ProgressBar::new(total as u64));
+                        bar.set_style(
+                            ProgressStyle::with_template(
+                                "{prefix:>9.bold} {bar:28.yellow/blue} {pos:>3}/{len:3} {elapsed_precise:.dim} {msg:.yellow}",
+                            )
+                            .unwrap(),
+                        );
+                        bar.set_prefix("merge");
+                        data_merge_pb = Some(bar);
+                    }
+                }
+                if let Some(bar) = data_merge_pb.as_ref() {
+                    bar.set_length(total as u64);
+                    bar.set_position(index.saturating_sub(1) as u64);
+                    bar.set_message(table_name);
+                }
+            },
+            plexos2duckdb::ProgressEvent::DataMergeTableEnd { index, total } => {
+                if let Some(bar) = data_merge_pb.as_ref() {
                     bar.set_length(total as u64);
                     bar.set_position(index as u64);
                     if index == total {
@@ -288,6 +326,9 @@ fn run(args: Args) -> Result<()> {
         if let Some(bar) = data_tables_pb.as_ref() {
             bar.finish_and_clear();
         }
+        if let Some(bar) = data_merge_pb.as_ref() {
+            bar.finish_and_clear();
+        }
         for bar in worker_tables_pb.values() {
             bar.finish_and_clear();
         }
@@ -301,7 +342,7 @@ fn run(args: Args) -> Result<()> {
     let mode =
         if args.in_memory { plexos2duckdb::DbWriteMode::InMemoryThenCopy } else { plexos2duckdb::DbWriteMode::Direct };
     let mut builder = dataset.to_duckdb(&output_path).with_mode(mode);
-    if let Some(threads) = args.data_write_threads {
+    if let Some(threads) = args.n_threads {
         builder = builder.with_data_write_threads(threads.get());
     }
     let builder =
@@ -321,6 +362,9 @@ fn run(args: Args) -> Result<()> {
         let _ = term.show_cursor();
     }
     if let Some(bar) = data_tables_pb.as_ref() {
+        bar.finish_and_clear();
+    }
+    if let Some(bar) = data_merge_pb.as_ref() {
         bar.finish_and_clear();
     }
     for bar in worker_tables_pb.values() {

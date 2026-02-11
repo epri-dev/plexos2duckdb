@@ -369,6 +369,8 @@ pub enum ProgressEvent {
     DataTableEnd,
     DataWorkerTableStart { worker_id: usize, index: usize, total: usize, table_name: String, keys: usize },
     DataWorkerTableEnd { worker_id: usize, index: usize, total: usize },
+    DataMergeTableStart { index: usize, total: usize, table_name: String },
+    DataMergeTableEnd { index: usize, total: usize },
 }
 
 #[derive(Debug)]
@@ -1665,7 +1667,6 @@ impl SolutionDataset {
         let (tx, rx) = std::sync::mpsc::channel::<DataWriteWorkerEvent>();
         let staged_shards = std::thread::scope(|scope| -> Result<Vec<StagedDataShard>> {
             let mut handles = Vec::with_capacity(worker_plans.len());
-            let tx = tx;
             for (worker_idx, worker_plan) in worker_plans.into_iter().enumerate() {
                 let shard_path = staging_dir.path().join(format!("data_stage_{worker_idx}.duckdb"));
                 let worker_tx = tx.clone();
@@ -1703,9 +1704,17 @@ impl SolutionDataset {
                     Ok(StagedDataShard { db_path: shard_path, table_names })
                 }));
             }
+            drop(tx);
 
             let mut completed_tables = 0usize;
-            while let Ok(event) = rx.recv() {
+            while completed_tables < total_tables {
+                let event = rx.recv().map_err(|_| {
+                    eyre!(
+                        "Worker progress channel closed before all tables completed ({}/{})",
+                        completed_tables,
+                        total_tables
+                    )
+                })?;
                 match event {
                     DataWriteWorkerEvent::TableStarted { worker_id, index, total, table_name, keys } => {
                         if let Some(report) = progress.as_mut() {
@@ -1742,6 +1751,7 @@ impl SolutionDataset {
             }
 
             let mut shards = Vec::with_capacity(handles.len());
+            Self::report_duckdb_progress(progress, "Finalizing staged worker shards");
             for handle in handles {
                 let result = handle.join().map_err(|_| eyre!("A data writer thread panicked"))?;
                 shards.push(result?);
@@ -1749,7 +1759,8 @@ impl SolutionDataset {
             Ok(shards)
         })?;
 
-        self.merge_staged_data_shards(con, &staged_shards)?;
+        Self::report_duckdb_progress(progress, "Merging staged data tables");
+        self.merge_staged_data_shards(con, &staged_shards, progress)?;
         Ok(())
     }
 
@@ -1772,17 +1783,41 @@ impl SolutionDataset {
         worker_plans
     }
 
-    fn merge_staged_data_shards(&self, con: &mut duckdb::Connection, shards: &[StagedDataShard]) -> Result<()> {
+    fn merge_staged_data_shards(
+        &self,
+        con: &mut duckdb::Connection,
+        shards: &[StagedDataShard],
+        progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
+        let total_merge_tables: usize = shards.iter().map(|s| s.table_names.len()).sum();
+        let mut merged_index = 0usize;
+
         for (idx, shard) in shards.iter().enumerate() {
             let schema_name = format!("stage_data_{idx}");
             let db_path = Self::sql_string_literal(shard.db_path.to_string_lossy().as_ref());
             con.execute_batch(&format!("ATTACH '{db_path}' AS {schema_name};"))?;
 
             for table_name in &shard.table_names {
+                merged_index += 1;
+                if let Some(report) = progress.as_mut() {
+                    report(DuckdbProgress::Event(ProgressEvent::DataMergeTableStart {
+                        index: merged_index,
+                        total: total_merge_tables,
+                        table_name: table_name.clone(),
+                    }));
+                }
+
                 let table_ident = Self::quote_ident(table_name);
                 con.execute_batch(&format!(
                     "CREATE TABLE data.{table_ident} AS SELECT * FROM {schema_name}.data.{table_ident};"
                 ))?;
+
+                if let Some(report) = progress.as_mut() {
+                    report(DuckdbProgress::Event(ProgressEvent::DataMergeTableEnd {
+                        index: merged_index,
+                        total: total_merge_tables,
+                    }));
+                }
             }
 
             con.execute_batch(&format!("DETACH {schema_name};"))?;
