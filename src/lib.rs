@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 #![doc = include_str!("../README.md")]
 
-use std::io::{BufReader, Read as _, Seek, SeekFrom};
+use std::io::Read as _;
 
 use color_eyre::{Result, eyre::eyre};
 use roxmltree::{Document, Node};
@@ -381,10 +381,28 @@ pub enum DbWriteMode {
     Direct,
 }
 
+#[derive(Debug, Clone)]
+struct DataTableWritePlan {
+    table_name: String,
+    key_ids: Vec<i64>,
+}
+
+#[derive(Debug)]
+struct StagedDataShard {
+    db_path: std::path::PathBuf,
+    table_names: Vec<String>,
+}
+
+#[derive(Debug)]
+enum DataWriteWorkerEvent {
+    TableCompleted { table_name: String, keys: usize },
+}
+
 pub struct DuckdbBuilder<'a> {
     dataset: &'a SolutionDataset,
     db_path: std::path::PathBuf,
     mode: DbWriteMode,
+    data_write_threads: Option<usize>,
     report: Option<&'a mut dyn FnMut(&str)>,
     progress: Option<&'a mut dyn FnMut(ProgressEvent)>,
 }
@@ -395,6 +413,7 @@ impl<'a> DuckdbBuilder<'a> {
             dataset,
             db_path: db_path.as_ref().to_path_buf(),
             mode: DbWriteMode::InMemoryThenCopy,
+            data_write_threads: None,
             report: None,
             progress: None,
         }
@@ -402,6 +421,11 @@ impl<'a> DuckdbBuilder<'a> {
 
     pub fn with_mode(mut self, mode: DbWriteMode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    pub fn with_data_write_threads(mut self, threads: usize) -> Self {
+        self.data_write_threads = Some(threads.max(1));
         self
     }
 
@@ -434,7 +458,7 @@ impl<'a> DuckdbBuilder<'a> {
             }
         };
         let combined_opt = if has_callbacks { Some(&mut combined as &mut dyn FnMut(DuckdbProgress)) } else { None };
-        self.dataset.to_duckdb_impl(&self.db_path, combined_opt, self.mode)
+        self.dataset.to_duckdb_impl(&self.db_path, combined_opt, self.mode, self.data_write_threads)
     }
 }
 
@@ -1367,6 +1391,7 @@ impl SolutionDataset {
         db_path: P,
         mut progress: Option<&mut dyn FnMut(DuckdbProgress)>,
         mode: DbWriteMode,
+        data_write_threads: Option<usize>,
     ) -> Result<()> {
         let db_path = db_path.as_ref();
         let total_steps = 28;
@@ -1489,7 +1514,7 @@ impl SolutionDataset {
 
         Self::report_duckdb_progress(&mut progress, "Writing time series data");
         Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing time series data", |progress| {
-            self.populate_table_data(&mut con, progress)
+            self.populate_table_data(&mut con, progress, data_write_threads)
         })?;
 
         Self::report_duckdb_progress(&mut progress, "Creating processed views");
@@ -1512,13 +1537,14 @@ impl SolutionDataset {
             "Persisting DuckDB database",
             |_progress| {
                 if let DbWriteMode::InMemoryThenCopy = mode {
+                    let db_path_sql = Self::sql_string_literal(db_path.to_str().unwrap_or_default());
                     con.execute_batch(&format!(
                         "
                           ATTACH '{}' as my_database;
                           COPY FROM DATABASE memory TO my_database;
                           DETACH my_database;
                         ",
-                        db_path.to_str().unwrap_or_default()
+                        db_path_sql
                     ))?;
                 } else {
                     con.execute_batch("CHECKPOINT;")?;
@@ -1534,59 +1560,225 @@ impl SolutionDataset {
         &self,
         con: &mut duckdb::Connection,
         progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+        data_write_threads: Option<usize>,
     ) -> Result<()> {
         con.execute_batch("CREATE SCHEMA IF NOT EXISTS data;")?;
 
-        let total_tables = self.table_key_index_mapping.len();
-        for (table_idx, (table_name, key_ids)) in self.table_key_index_mapping.clone().into_iter().enumerate() {
+        let plans = self.build_data_table_plans();
+        let total_tables = plans.len();
+        if total_tables == 0 {
+            return Ok(());
+        }
+
+        let worker_count = Self::resolve_data_write_threads(total_tables, data_write_threads);
+        if worker_count <= 1 {
+            return self.populate_table_data_sequential(con, plans, progress);
+        }
+        self.populate_table_data_parallel(con, plans, worker_count, progress)
+    }
+
+    fn build_data_table_plans(&self) -> Vec<DataTableWritePlan> {
+        let mut plans = self
+            .table_key_index_mapping
+            .iter()
+            .map(|(table_name, key_ids)| {
+                DataTableWritePlan { table_name: table_name.clone(), key_ids: key_ids.clone() }
+            })
+            .collect::<Vec<_>>();
+
+        plans.sort_by(|a, b| b.key_ids.len().cmp(&a.key_ids.len()).then_with(|| a.table_name.cmp(&b.table_name)));
+        plans
+    }
+
+    fn resolve_data_write_threads(total_tables: usize, configured_threads: Option<usize>) -> usize {
+        const MAX_AUTO_DATA_WRITE_THREADS: usize = 8;
+
+        match configured_threads {
+            Some(threads) => threads.max(1).min(total_tables),
+            None => {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+                    .min(MAX_AUTO_DATA_WRITE_THREADS)
+                    .min(total_tables)
+            },
+        }
+    }
+
+    fn populate_table_data_sequential(
+        &self,
+        con: &mut duckdb::Connection,
+        plans: Vec<DataTableWritePlan>,
+        progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
+        let total_tables = plans.len();
+
+        for (table_idx, plan) in plans.into_iter().enumerate() {
             if let Some(report) = progress.as_mut() {
                 report(DuckdbProgress::Event(ProgressEvent::DataTableStart {
                     index: table_idx + 1,
                     total: total_tables,
-                    table_name: table_name.clone(),
-                    keys: key_ids.len(),
+                    table_name: plan.table_name.clone(),
+                    keys: plan.key_ids.len(),
                 }));
             }
 
-            con.execute_batch(&format!(
-                r#"
-                CREATE TABLE data."{table_name}" (
-                  key_id BIGINT,
-                  sample_id BIGINT,
-                  band_id BIGINT,
-                  membership_id BIGINT,
-                  block_id BIGINT,
-                  value DOUBLE
-                )
-            "#
-            ))?;
+            self.append_single_data_table(con, &plan)?;
 
-            let mut appender = con.appender_to_db(&table_name, "data")?;
+            if let Some(report) = progress.as_mut() {
+                report(DuckdbProgress::Event(ProgressEvent::DataTableEnd));
+            }
+        }
 
-            for key_id in key_ids.into_iter() {
-                let ki = self.key_index(key_id)?;
-                let key = self.key(key_id)?;
+        Ok(())
+    }
 
-                let file = self
-                    .period_data
-                    .get(&ki.period_type_id)
-                    .ok_or_else(|| eyre!("period type not found: {}", ki.period_type_id))?;
+    fn populate_table_data_parallel(
+        &self,
+        con: &mut duckdb::Connection,
+        plans: Vec<DataTableWritePlan>,
+        worker_count: usize,
+        progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
+        let total_tables = plans.len();
+        let mut worker_plans = vec![Vec::<DataTableWritePlan>::new(); worker_count];
+        for (idx, plan) in plans.into_iter().enumerate() {
+            worker_plans[idx % worker_count].push(plan);
+        }
+        worker_plans.retain(|p| !p.is_empty());
 
-                if ki.position % 8 != 0 {
-                    return Err(eyre!("BIN position misaligned for key_id {} (pos_bytes={})", key_id, ki.position));
+        let staging_dir = tempfile::TempDir::new()?;
+        let (tx, rx) = std::sync::mpsc::channel::<DataWriteWorkerEvent>();
+        let staged_shards = std::thread::scope(|scope| -> Result<Vec<StagedDataShard>> {
+            let mut handles = Vec::with_capacity(worker_plans.len());
+            for (worker_idx, worker_plan) in worker_plans.into_iter().enumerate() {
+                let shard_path = staging_dir.path().join(format!("data_stage_{worker_idx}.duckdb"));
+                let worker_tx = tx.clone();
+
+                handles.push(scope.spawn(move || -> Result<StagedDataShard> {
+                    let mut worker_con = duckdb::Connection::open(&shard_path)?;
+                    worker_con
+                        .execute_batch("SET preserve_insertion_order = false; CREATE SCHEMA IF NOT EXISTS data;")?;
+
+                    let mut table_names = Vec::with_capacity(worker_plan.len());
+                    for table_plan in worker_plan {
+                        self.append_single_data_table(&mut worker_con, &table_plan)?;
+                        let _ = worker_tx.send(DataWriteWorkerEvent::TableCompleted {
+                            table_name: table_plan.table_name.clone(),
+                            keys: table_plan.key_ids.len(),
+                        });
+                        table_names.push(table_plan.table_name);
+                    }
+
+                    Ok(StagedDataShard { db_path: shard_path, table_names })
+                }));
+            }
+            drop(tx);
+
+            let mut completed_tables = 0usize;
+            while let Ok(event) = rx.recv() {
+                match event {
+                    DataWriteWorkerEvent::TableCompleted { table_name, keys } => {
+                        completed_tables += 1;
+                        if let Some(report) = progress.as_mut() {
+                            report(DuckdbProgress::Event(ProgressEvent::DataTableStart {
+                                index: completed_tables,
+                                total: total_tables,
+                                table_name,
+                                keys,
+                            }));
+                            report(DuckdbProgress::Event(ProgressEvent::DataTableEnd));
+                        }
+                    },
                 }
+            }
 
-                let mut reader = BufReader::new(file.try_clone()?);
-                reader.seek(SeekFrom::Start(ki.position))?;
+            let mut shards = Vec::with_capacity(handles.len());
+            for handle in handles {
+                let result = handle.join().map_err(|_| eyre!("A data writer thread panicked"))?;
+                shards.push(result?);
+            }
+            Ok(shards)
+        })?;
 
-                let period_offset: i64 = ki.period_offset;
-                let mut buf = [0u8; 8];
-                let mut i: u64 = 0;
-                while i < ki.length {
-                    reader.read_exact(&mut buf)?;
-                    let value = f64::from_le_bytes(buf);
+        self.merge_staged_data_shards(con, &staged_shards)?;
+        Ok(())
+    }
 
-                    let block_id_i64 = i64::try_from(i)
+    fn merge_staged_data_shards(&self, con: &mut duckdb::Connection, shards: &[StagedDataShard]) -> Result<()> {
+        for (idx, shard) in shards.iter().enumerate() {
+            let schema_name = format!("stage_data_{idx}");
+            let db_path = Self::sql_string_literal(shard.db_path.to_string_lossy().as_ref());
+            con.execute_batch(&format!("ATTACH '{db_path}' AS {schema_name};"))?;
+
+            for table_name in &shard.table_names {
+                let table_ident = Self::quote_ident(table_name);
+                con.execute_batch(&format!(
+                    "CREATE TABLE data.{table_ident} AS SELECT * FROM {schema_name}.data.{table_ident};"
+                ))?;
+            }
+
+            con.execute_batch(&format!("DETACH {schema_name};"))?;
+        }
+
+        Ok(())
+    }
+
+    fn append_single_data_table(&self, con: &mut duckdb::Connection, plan: &DataTableWritePlan) -> Result<()> {
+        self.create_data_table(con, plan.table_name.as_str())?;
+        let mut appender = con.appender_to_db(plan.table_name.as_str(), "data")?;
+
+        const DATA_READ_CHUNK_VALUES: u64 = 4096;
+        let mut chunk_buf = vec![0u8; (DATA_READ_CHUNK_VALUES as usize) * 8];
+
+        for key_id in plan.key_ids.iter().copied() {
+            let ki = self.key_index(key_id)?;
+            let key = self.key(key_id)?;
+
+            let file = self
+                .period_data
+                .get(&ki.period_type_id)
+                .ok_or_else(|| eyre!("period type not found: {}", ki.period_type_id))?;
+
+            if ki.position % 8 != 0 {
+                return Err(eyre!("BIN position misaligned for key_id {} (pos_bytes={})", key_id, ki.position));
+            }
+
+            let period_offset: i64 = ki.period_offset;
+            let mut i: u64 = 0;
+            while i < ki.length {
+                let chunk_values = (ki.length - i).min(DATA_READ_CHUNK_VALUES);
+                let chunk_bytes_u64 =
+                    chunk_values.checked_mul(8).ok_or_else(|| eyre!("Chunk size overflow for key_id {}", key_id))?;
+                let chunk_bytes = usize::try_from(chunk_bytes_u64)
+                    .map_err(|_| eyre!("Chunk size exceeds usize for key_id {}", key_id))?;
+                let offset_delta =
+                    i.checked_mul(8).ok_or_else(|| eyre!("Byte offset overflow for key_id {}", key_id))?;
+                let chunk_offset = ki
+                    .position
+                    .checked_add(offset_delta)
+                    .ok_or_else(|| eyre!("Byte offset overflow for key_id {}", key_id))?;
+
+                Self::read_exact_at(file, chunk_offset, &mut chunk_buf[..chunk_bytes]).map_err(|err| {
+                    eyre!("Failed reading period data for key_id {} at byte offset {}: {}", key_id, chunk_offset, err)
+                })?;
+
+                let mut chunk_i: u64 = 0;
+                while chunk_i < chunk_values {
+                    let byte_idx = (chunk_i as usize) * 8;
+                    let value = f64::from_le_bytes([
+                        chunk_buf[byte_idx],
+                        chunk_buf[byte_idx + 1],
+                        chunk_buf[byte_idx + 2],
+                        chunk_buf[byte_idx + 3],
+                        chunk_buf[byte_idx + 4],
+                        chunk_buf[byte_idx + 5],
+                        chunk_buf[byte_idx + 6],
+                        chunk_buf[byte_idx + 7],
+                    ]);
+
+                    let block_idx = i + chunk_i;
+                    let block_id_i64 = i64::try_from(block_idx)
                         .map_err(|_| eyre!("block_id exceeds i64 for key_id {}", key_id))?
                         .checked_add(period_offset)
                         .and_then(|v| v.checked_add(1))
@@ -1601,18 +1793,73 @@ impl SolutionDataset {
                         value
                     ])?;
 
-                    i += 1;
+                    chunk_i += 1;
                 }
-            }
 
-            appender.flush()?;
-
-            if let Some(report) = progress.as_mut() {
-                report(DuckdbProgress::Event(ProgressEvent::DataTableEnd));
+                i += chunk_values;
             }
         }
 
+        appender.flush()?;
         Ok(())
+    }
+
+    fn create_data_table(&self, con: &mut duckdb::Connection, table_name: &str) -> Result<()> {
+        let table_ident = Self::quote_ident(table_name);
+        con.execute_batch(&format!(
+            r#"
+            CREATE TABLE data.{table_ident} (
+              key_id BIGINT,
+              sample_id BIGINT,
+              band_id BIGINT,
+              membership_id BIGINT,
+              block_id BIGINT,
+              value DOUBLE
+            )
+        "#
+        ))?;
+        Ok(())
+    }
+
+    fn quote_ident(identifier: &str) -> String {
+        format!("\"{}\"", identifier.replace('\"', "\"\""))
+    }
+
+    fn sql_string_literal(value: &str) -> String {
+        value.replace('\'', "''")
+    }
+
+    fn read_exact_at(file: &std::fs::File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt as _;
+            return file.read_exact_at(buf, offset);
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt as _;
+
+            let mut read_total = 0usize;
+            while read_total < buf.len() {
+                let n = file.seek_read(&mut buf[read_total..], offset + read_total as u64)?;
+                if n == 0 {
+                    return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "failed to fill whole buffer"));
+                }
+                read_total += n;
+            }
+
+            return Ok(());
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            use std::io::{Read as _, Seek as _, SeekFrom};
+
+            let mut clone = file.try_clone()?;
+            clone.seek(SeekFrom::Start(offset))?;
+            clone.read_exact(buf)
+        }
     }
 
     fn populate_table_config(
