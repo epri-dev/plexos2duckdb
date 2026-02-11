@@ -395,7 +395,6 @@ struct DataTableWritePlan {
 #[derive(Debug)]
 struct StagedDataShard {
     db_path: std::path::PathBuf,
-    table_names: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -1614,7 +1613,7 @@ impl SolutionDataset {
         const MAX_AUTO_DATA_WRITE_THREADS: usize = 8;
 
         match configured_threads {
-            Some(threads) => threads.max(1).min(total_tables).min(MAX_AUTO_DATA_WRITE_THREADS),
+            Some(threads) => threads.max(1).min(total_tables),
             None => {
                 std::thread::available_parallelism()
                     .map(|n| n.get())
@@ -1676,7 +1675,6 @@ impl SolutionDataset {
                     worker_con
                         .execute_batch("SET preserve_insertion_order = false; CREATE SCHEMA IF NOT EXISTS data;")?;
 
-                    let mut table_names = Vec::with_capacity(worker_plan.len());
                     let worker_total = worker_plan.len();
                     for (worker_table_idx, table_plan) in worker_plan.into_iter().enumerate() {
                         let worker_table_index = worker_table_idx + 1;
@@ -1698,10 +1696,9 @@ impl SolutionDataset {
                             table_name,
                             keys,
                         });
-                        table_names.push(table_plan.table_name);
                     }
 
-                    Ok(StagedDataShard { db_path: shard_path, table_names })
+                    Ok(StagedDataShard { db_path: shard_path })
                 }));
             }
             drop(tx);
@@ -1789,38 +1786,34 @@ impl SolutionDataset {
         shards: &[StagedDataShard],
         progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
     ) -> Result<()> {
-        let total_merge_tables: usize = shards.iter().map(|s| s.table_names.len()).sum();
-        let mut merged_index = 0usize;
+        let target_catalog = Self::current_catalog_name(con)?;
+        let target_catalog_ident = Self::quote_ident(&target_catalog);
+        let total_shards = shards.len();
 
         for (idx, shard) in shards.iter().enumerate() {
-            let schema_name = format!("stage_data_{idx}");
+            let shard_alias = format!("stage_data_{idx}");
+            let shard_alias_ident = Self::quote_ident(&shard_alias);
             let db_path = Self::sql_string_literal(shard.db_path.to_string_lossy().as_ref());
-            con.execute_batch(&format!("ATTACH '{db_path}' AS {schema_name};"))?;
+            let merge_index = idx + 1;
 
-            for table_name in &shard.table_names {
-                merged_index += 1;
-                if let Some(report) = progress.as_mut() {
-                    report(DuckdbProgress::Event(ProgressEvent::DataMergeTableStart {
-                        index: merged_index,
-                        total: total_merge_tables,
-                        table_name: table_name.clone(),
-                    }));
-                }
-
-                let table_ident = Self::quote_ident(table_name);
-                con.execute_batch(&format!(
-                    "CREATE TABLE data.{table_ident} AS SELECT * FROM {schema_name}.data.{table_ident};"
-                ))?;
-
-                if let Some(report) = progress.as_mut() {
-                    report(DuckdbProgress::Event(ProgressEvent::DataMergeTableEnd {
-                        index: merged_index,
-                        total: total_merge_tables,
-                    }));
-                }
+            if let Some(report) = progress.as_mut() {
+                report(DuckdbProgress::Event(ProgressEvent::DataMergeTableStart {
+                    index: merge_index,
+                    total: total_shards,
+                    table_name: format!("shard {}", merge_index),
+                }));
             }
 
-            con.execute_batch(&format!("DETACH {schema_name};"))?;
+            con.execute_batch(&format!("ATTACH '{db_path}' AS {shard_alias_ident};"))?;
+            con.execute_batch(&format!("COPY FROM DATABASE {shard_alias_ident} TO {target_catalog_ident};"))?;
+            con.execute_batch(&format!("DETACH {shard_alias_ident};"))?;
+
+            if let Some(report) = progress.as_mut() {
+                report(DuckdbProgress::Event(ProgressEvent::DataMergeTableEnd {
+                    index: merge_index,
+                    total: total_shards,
+                }));
+            }
         }
 
         Ok(())
@@ -1929,6 +1922,16 @@ impl SolutionDataset {
 
     fn sql_string_literal(value: &str) -> String {
         value.replace('\'', "''")
+    }
+
+    fn current_catalog_name(con: &duckdb::Connection) -> Result<String> {
+        let mut stmt = con.prepare("SELECT current_catalog();")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            Ok(row.get(0)?)
+        } else {
+            Err(eyre!("Failed to resolve current DuckDB catalog name"))
+        }
     }
 
     fn read_exact_at(file: &std::fs::File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
