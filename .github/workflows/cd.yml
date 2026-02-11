@@ -84,4 +84,3 @@ jobs:
           ref: ${{ env.REF }}
           include: LICENSE,README.md
           leading-dir: true
-          strip: true
