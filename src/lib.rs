@@ -367,6 +367,8 @@ pub struct SolutionDataset {
 pub enum ProgressEvent {
     DataTableStart { index: usize, total: usize, table_name: String, keys: usize },
     DataTableEnd,
+    DataWorkerTableStart { worker_id: usize, index: usize, total: usize, table_name: String, keys: usize },
+    DataWorkerTableEnd { worker_id: usize, index: usize, total: usize },
 }
 
 #[derive(Debug)]
@@ -385,6 +387,7 @@ pub enum DbWriteMode {
 struct DataTableWritePlan {
     table_name: String,
     key_ids: Vec<i64>,
+    estimated_values: u128,
 }
 
 #[derive(Debug)]
@@ -395,7 +398,8 @@ struct StagedDataShard {
 
 #[derive(Debug)]
 enum DataWriteWorkerEvent {
-    TableCompleted { table_name: String, keys: usize },
+    TableStarted { worker_id: usize, index: usize, total: usize, table_name: String, keys: usize },
+    TableCompleted { worker_id: usize, index: usize, total: usize, table_name: String, keys: usize },
 }
 
 pub struct DuckdbBuilder<'a> {
@@ -1564,7 +1568,7 @@ impl SolutionDataset {
     ) -> Result<()> {
         con.execute_batch("CREATE SCHEMA IF NOT EXISTS data;")?;
 
-        let plans = self.build_data_table_plans();
+        let plans = self.build_data_table_plans()?;
         let total_tables = plans.len();
         if total_tables == 0 {
             return Ok(());
@@ -1577,24 +1581,38 @@ impl SolutionDataset {
         self.populate_table_data_parallel(con, plans, worker_count, progress)
     }
 
-    fn build_data_table_plans(&self) -> Vec<DataTableWritePlan> {
-        let mut plans = self
-            .table_key_index_mapping
-            .iter()
-            .map(|(table_name, key_ids)| {
-                DataTableWritePlan { table_name: table_name.clone(), key_ids: key_ids.clone() }
-            })
-            .collect::<Vec<_>>();
+    fn build_data_table_plans(&self) -> Result<Vec<DataTableWritePlan>> {
+        let mut plans = Vec::with_capacity(self.table_key_index_mapping.len());
+        for (table_name, key_ids) in self.table_key_index_mapping.iter() {
+            let mut estimated_values = 0u128;
+            for key_id in key_ids.iter().copied() {
+                let length = self.key_index(key_id)?.length;
+                estimated_values = estimated_values.checked_add(u128::from(length)).ok_or_else(|| {
+                    eyre!("Estimated workload overflow for table '{}' while planning data writes", table_name)
+                })?;
+            }
 
-        plans.sort_by(|a, b| b.key_ids.len().cmp(&a.key_ids.len()).then_with(|| a.table_name.cmp(&b.table_name)));
-        plans
+            plans.push(DataTableWritePlan {
+                table_name: table_name.clone(),
+                key_ids: key_ids.clone(),
+                estimated_values,
+            });
+        }
+
+        plans.sort_by(|a, b| {
+            b.estimated_values
+                .cmp(&a.estimated_values)
+                .then_with(|| b.key_ids.len().cmp(&a.key_ids.len()))
+                .then_with(|| a.table_name.cmp(&b.table_name))
+        });
+        Ok(plans)
     }
 
     fn resolve_data_write_threads(total_tables: usize, configured_threads: Option<usize>) -> usize {
         const MAX_AUTO_DATA_WRITE_THREADS: usize = 8;
 
         match configured_threads {
-            Some(threads) => threads.max(1).min(total_tables),
+            Some(threads) => threads.max(1).min(total_tables).min(MAX_AUTO_DATA_WRITE_THREADS),
             None => {
                 std::thread::available_parallelism()
                     .map(|n| n.get())
@@ -1641,16 +1659,13 @@ impl SolutionDataset {
         progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
     ) -> Result<()> {
         let total_tables = plans.len();
-        let mut worker_plans = vec![Vec::<DataTableWritePlan>::new(); worker_count];
-        for (idx, plan) in plans.into_iter().enumerate() {
-            worker_plans[idx % worker_count].push(plan);
-        }
-        worker_plans.retain(|p| !p.is_empty());
+        let worker_plans = Self::distribute_data_table_plans(plans, worker_count);
 
         let staging_dir = tempfile::TempDir::new()?;
         let (tx, rx) = std::sync::mpsc::channel::<DataWriteWorkerEvent>();
         let staged_shards = std::thread::scope(|scope| -> Result<Vec<StagedDataShard>> {
             let mut handles = Vec::with_capacity(worker_plans.len());
+            let tx = tx;
             for (worker_idx, worker_plan) in worker_plans.into_iter().enumerate() {
                 let shard_path = staging_dir.path().join(format!("data_stage_{worker_idx}.duckdb"));
                 let worker_tx = tx.clone();
@@ -1661,11 +1676,26 @@ impl SolutionDataset {
                         .execute_batch("SET preserve_insertion_order = false; CREATE SCHEMA IF NOT EXISTS data;")?;
 
                     let mut table_names = Vec::with_capacity(worker_plan.len());
-                    for table_plan in worker_plan {
+                    let worker_total = worker_plan.len();
+                    for (worker_table_idx, table_plan) in worker_plan.into_iter().enumerate() {
+                        let worker_table_index = worker_table_idx + 1;
+                        let table_name = table_plan.table_name.clone();
+                        let keys = table_plan.key_ids.len();
+                        let _ = worker_tx.send(DataWriteWorkerEvent::TableStarted {
+                            worker_id: worker_idx,
+                            index: worker_table_index,
+                            total: worker_total,
+                            table_name: table_name.clone(),
+                            keys,
+                        });
+
                         self.append_single_data_table(&mut worker_con, &table_plan)?;
                         let _ = worker_tx.send(DataWriteWorkerEvent::TableCompleted {
-                            table_name: table_plan.table_name.clone(),
-                            keys: table_plan.key_ids.len(),
+                            worker_id: worker_idx,
+                            index: worker_table_index,
+                            total: worker_total,
+                            table_name,
+                            keys,
                         });
                         table_names.push(table_plan.table_name);
                     }
@@ -1673,12 +1703,30 @@ impl SolutionDataset {
                     Ok(StagedDataShard { db_path: shard_path, table_names })
                 }));
             }
-            drop(tx);
 
             let mut completed_tables = 0usize;
             while let Ok(event) = rx.recv() {
                 match event {
-                    DataWriteWorkerEvent::TableCompleted { table_name, keys } => {
+                    DataWriteWorkerEvent::TableStarted { worker_id, index, total, table_name, keys } => {
+                        if let Some(report) = progress.as_mut() {
+                            report(DuckdbProgress::Event(ProgressEvent::DataWorkerTableStart {
+                                worker_id,
+                                index,
+                                total,
+                                table_name,
+                                keys,
+                            }));
+                        }
+                    },
+                    DataWriteWorkerEvent::TableCompleted { worker_id, index, total, table_name, keys } => {
+                        if let Some(report) = progress.as_mut() {
+                            report(DuckdbProgress::Event(ProgressEvent::DataWorkerTableEnd {
+                                worker_id,
+                                index,
+                                total,
+                            }));
+                        }
+
                         completed_tables += 1;
                         if let Some(report) = progress.as_mut() {
                             report(DuckdbProgress::Event(ProgressEvent::DataTableStart {
@@ -1703,6 +1751,25 @@ impl SolutionDataset {
 
         self.merge_staged_data_shards(con, &staged_shards)?;
         Ok(())
+    }
+
+    fn distribute_data_table_plans(
+        plans: Vec<DataTableWritePlan>,
+        worker_count: usize,
+    ) -> Vec<Vec<DataTableWritePlan>> {
+        let mut worker_plans = vec![Vec::<DataTableWritePlan>::new(); worker_count];
+        let mut worker_loads = vec![0u128; worker_count];
+
+        for plan in plans {
+            let (worker_idx, _) =
+                worker_loads.iter().enumerate().min_by_key(|(_, load)| **load).expect("worker_count must be non-zero");
+
+            worker_loads[worker_idx] = worker_loads[worker_idx].saturating_add(plan.estimated_values);
+            worker_plans[worker_idx].push(plan);
+        }
+
+        worker_plans.retain(|p| !p.is_empty());
+        worker_plans
     }
 
     fn merge_staged_data_shards(&self, con: &mut duckdb::Connection, shards: &[StagedDataShard]) -> Result<()> {
