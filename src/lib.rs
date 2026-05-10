@@ -3737,6 +3737,29 @@ impl SolutionDataset {
                 .split("__")
                 .nth(3)
                 .ok_or_else(|| eyre!("Property name not found"))?;
+            let timestamp_block_name = format!("{phase_name}__{period_name}");
+            let (timestamp_select, timestamp_join, timestamp_order) = if self
+                .timestamp_block
+                .contains_key(timestamp_block_name.as_str())
+            {
+                (
+                    "p.datetime AS timestamp,
+                  p.interval_length AS interval_length,"
+                        .to_string(),
+                    format!(
+                        "LEFT JOIN processed.timestamp_block_{timestamp_block_name} p ON d.block_id = p.block_id"
+                    ),
+                    "p.datetime",
+                )
+            } else {
+                (
+                    "NULL::TIMESTAMP AS timestamp,
+                  NULL::BIGINT AS interval_length,"
+                        .to_string(),
+                    String::new(),
+                    "d.block_id",
+                )
+            };
             con.execute_batch(&format!(
                 "
                 CREATE VIEW report.\"{table_name}\" AS SELECT
@@ -3744,22 +3767,21 @@ impl SolutionDataset {
                   s.sample_name,
                   m.child_name AS name,
                   m.child_category AS category,
-                  p.datetime AS timestamp,
-                  p.interval_length AS interval_length,
+                  {timestamp_select}
                   d.value AS \"{property_name}\",
                   pr.unit AS unit,
                   FROM
                     data.\"{table_name}\" d
                     LEFT JOIN raw.samples s ON d.sample_id = s.sample_id
                     LEFT JOIN processed.memberships m ON d.membership_id = m.membership_id
-                    LEFT JOIN processed.timestamp_block_{phase_name}__{period_name} p ON d.block_id = p.block_id
+                    {timestamp_join}
                     LEFT JOIN raw.keys k ON d.key_id = k.key_id
                     LEFT JOIN processed.properties pr ON k.property_id = pr.property_id AND k.is_summary = pr.is_summary
                   ORDER BY
                     d.band_id,
                     s.sample_id,
                     m.membership_id,
-                    p.datetime
+                    {timestamp_order}
                   ;
                   ",
             ))?;
