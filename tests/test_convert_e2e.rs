@@ -49,13 +49,6 @@ const EXPECTED_REPORT_PREFIX_COLUMNS: &[&str] = &[
     "timestamp",
     "interval_length",
 ];
-const DETAILED_FIXTURE_NAMES: &[&str] = &[
-    "Model DAY_AHEAD Solution.zip",
-    "Model_Base_LT_Solution.zip",
-    "Model_Base_Solution.zip",
-    "Model_Base_ST_Solution.zip",
-];
-
 const EXPECTED_SCHEMAS: &[&str] = &["data", "main", "processed", "raw", "report"];
 const EXPECTED_RAW_TABLES: &[(&str, &[&str])] = &[
     ("config", &["element", "value"]),
@@ -363,23 +356,14 @@ fn assert_report_view_shape(con: &Connection, view_name: &str, metric_name: &str
 }
 
 #[test]
-fn additional_solution_zip_fixtures_convert_end_to_end() {
+fn all_solution_zip_fixtures_convert_end_to_end() {
     let fixture_dir = fixture_dir();
     let temp_dir = temp_dir();
-    let fixture_paths = solution_zip_fixture_paths(&fixture_dir)
-        .into_iter()
-        .filter(|path| {
-            let file_name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .expect("fixture file name utf8");
-            !DETAILED_FIXTURE_NAMES.contains(&file_name)
-        })
-        .collect::<Vec<_>>();
+    let fixture_paths = solution_zip_fixture_paths(&fixture_dir);
 
     assert!(
         !fixture_paths.is_empty(),
-        "expected at least one additional ZIP fixture"
+        "expected at least one ZIP fixture"
     );
 
     for source_path in fixture_paths {
