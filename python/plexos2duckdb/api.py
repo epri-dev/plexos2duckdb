@@ -68,7 +68,7 @@ class PLEXOS2DuckDB:
         self.open()
         return self
 
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+    def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
         self.close()
 
     @property
@@ -195,6 +195,7 @@ class PLEXOS2DuckDB:
         force: bool = False,
         in_memory: bool = False,
         n_threads: int | None = None,
+        table_name_pattern: str | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
     ) -> pathlib.Path:
         input_path = self._resolve_input_path(input_path)
@@ -217,6 +218,8 @@ class PLEXOS2DuckDB:
             args.append("--in-memory")
         if n_threads is not None:
             args.extend(["--n-threads", str(n_threads)])
+        if table_name_pattern is not None:
+            args.extend(["--table-name-pattern", table_name_pattern])
 
         if on_event is None:
             completed = self._run_command(args)
@@ -324,9 +327,14 @@ class PLEXOS2DuckDB:
                 if table_type == "BASE TABLE":
                     quoted_schema = self._quote_ident(schema)
                     quoted_table = self._quote_ident(table_name)
-                    count = connection.execute(
+                    count_row = connection.execute(
                         f"SELECT COUNT(*) FROM {quoted_schema}.{quoted_table}"
-                    ).fetchone()[0]
+                    ).fetchone()
+                    if count_row is None:
+                        raise PLEXOS2DuckDBError(
+                            f"Could not count rows for {quoted_schema}.{quoted_table}"
+                        )
+                    count = count_row[0]
                     row_count = str(count)
                 inventory.append(
                     {
