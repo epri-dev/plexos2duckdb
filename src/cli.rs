@@ -60,9 +60,6 @@ pub struct ConvertArgs {
     /// Regex matched against generated data table names; defaults to all tables
     #[arg(long)]
     pub table_name_pattern: Option<String>,
-    /// Deflate seek-index spacing for compressed ZIP BIN files, in MiB
-    #[arg(long, default_value_t = plexos2duckdb::DEFAULT_DEFLATE_INDEX_INTERVAL_MIB)]
-    pub deflate_index_interval_mib: u64,
     /// Output format for diagnostics and results
     #[arg(long = "format-diagnostics", value_enum, default_value_t = OutputFormat::Text)]
     pub format_diagnostics: OutputFormat,
@@ -135,20 +132,6 @@ enum ConvertJsonEvent {
         keys: usize,
     },
     DataWorkerTableEnd {
-        worker_id: usize,
-        index: usize,
-        total: usize,
-    },
-    DataWorkerRangeStart {
-        worker_id: usize,
-        index: usize,
-        total: usize,
-        table_name: String,
-        key_id: i64,
-        start_value: u64,
-        values: u64,
-    },
-    DataWorkerRangeEnd {
         worker_id: usize,
         index: usize,
         total: usize,
@@ -390,6 +373,19 @@ fn inspect_database(args: InspectArgs) -> Result<()> {
     Ok(())
 }
 
+fn total_time_line(start_time: Option<Instant>, now: Instant) -> Option<String> {
+    start_time.map(|start| {
+        let total = now.duration_since(start);
+        format!("Total time: {:.2}s", total.as_secs_f64())
+    })
+}
+
+fn print_total_time(start_time: Option<Instant>) {
+    if let Some(line) = total_time_line(start_time, Instant::now()) {
+        eprintln!("{}", line.green());
+    }
+}
+
 fn convert(args: ConvertArgs) -> Result<()> {
     let json_mode = args.format_diagnostics == OutputFormat::Json;
     let input_path = resolve_input_path(&args.input)?;
@@ -417,7 +413,6 @@ fn convert(args: ConvertArgs) -> Result<()> {
     let mut last_msg = String::new();
     let mut start_time = None;
     let mut last_mark = None;
-    let mut total_line = None;
     let mut term = None;
     if !args.no_progress_bar && !json_mode {
         let term_handle = Term::stderr();
@@ -473,10 +468,6 @@ fn convert(args: ConvertArgs) -> Result<()> {
                 last_msg.clear();
                 last_msg.push_str(msg);
                 last_mark = Some(now);
-                if let Some(start) = start_time {
-                    let total = now.duration_since(start);
-                    total_line = Some(format!("Total time: {:.2}s", total.as_secs_f64()));
-                }
             }
         }
     };
@@ -514,32 +505,6 @@ fn convert(args: ConvertArgs) -> Result<()> {
                     index,
                     total,
                 } => ConvertJsonEvent::DataWorkerTableEnd {
-                    worker_id,
-                    index,
-                    total,
-                },
-                plexos2duckdb::ProgressEvent::DataWorkerRangeStart {
-                    worker_id,
-                    index,
-                    total,
-                    table_name,
-                    key_id,
-                    start_value,
-                    values,
-                } => ConvertJsonEvent::DataWorkerRangeStart {
-                    worker_id,
-                    index,
-                    total,
-                    table_name,
-                    key_id,
-                    start_value,
-                    values,
-                },
-                plexos2duckdb::ProgressEvent::DataWorkerRangeEnd {
-                    worker_id,
-                    index,
-                    total,
-                } => ConvertJsonEvent::DataWorkerRangeEnd {
                     worker_id,
                     index,
                     total,
@@ -630,50 +595,6 @@ fn convert(args: ConvertArgs) -> Result<()> {
                 }
             },
             plexos2duckdb::ProgressEvent::DataWorkerTableEnd {
-                worker_id,
-                index,
-                total,
-            } => {
-                if let Some(bar) = worker_tables_pb.get(&worker_id) {
-                    bar.set_length(total as u64);
-                    bar.set_position(index as u64);
-                    if index == total {
-                        bar.set_message("done");
-                    }
-                }
-            },
-            plexos2duckdb::ProgressEvent::DataWorkerRangeStart {
-                worker_id,
-                index,
-                total,
-                table_name,
-                key_id,
-                start_value,
-                values,
-            } => {
-                if !worker_tables_pb.contains_key(&worker_id) {
-                    if let Some(multi) = mp.as_ref() {
-                        let bar = multi.add(ProgressBar::new(total as u64));
-                        bar.set_style(
-                            ProgressStyle::with_template(
-                                "{prefix:>9.bold} {bar:10.green/blue} {pos:>3}/{len:3} {elapsed_precise:.dim} {msg:.green}",
-                            )
-                            .unwrap(),
-                        );
-                        bar.set_prefix(format!("thread-{}", worker_id + 1));
-                        worker_tables_pb.insert(worker_id, bar);
-                    }
-                }
-                if let Some(bar) = worker_tables_pb.get(&worker_id) {
-                    bar.set_length(total as u64);
-                    bar.set_position(index.saturating_sub(1) as u64);
-                    let end_value = start_value.saturating_add(values);
-                    bar.set_message(format!(
-                        "{table_name} key {key_id} {start_value}..{end_value}"
-                    ));
-                }
-            },
-            plexos2duckdb::ProgressEvent::DataWorkerRangeEnd {
                 worker_id,
                 index,
                 total,
@@ -828,9 +749,7 @@ fn convert(args: ConvertArgs) -> Result<()> {
         for bar in worker_tables_pb.values() {
             bar.finish_and_clear();
         }
-        if let Some(line) = total_line.as_ref() {
-            eprintln!("{}", line.green());
-        }
+        print_total_time(start_time);
         dataset.print_summary();
         return Ok(());
     }
@@ -843,16 +762,6 @@ fn convert(args: ConvertArgs) -> Result<()> {
     if let Some(pattern) = table_name_pattern {
         builder = builder.with_data_table_name_pattern(pattern);
     }
-    if args.deflate_index_interval_mib == 0 {
-        return Err(eyre!(
-            "--deflate-index-interval-mib must be greater than zero"
-        ));
-    }
-    let deflate_index_interval_bytes = args
-        .deflate_index_interval_mib
-        .checked_mul(1024 * 1024)
-        .ok_or_else(|| eyre!("--deflate-index-interval-mib is too large"))?;
-    builder = builder.with_deflate_index_interval_bytes(deflate_index_interval_bytes);
     let builder = if json_mode || !args.no_progress_bar {
         builder
             .with_progress(&mut report)
@@ -891,9 +800,7 @@ fn convert(args: ConvertArgs) -> Result<()> {
     for bar in worker_tables_pb.values() {
         bar.finish_and_clear();
     }
-    if let Some(line) = total_line.as_ref() {
-        eprintln!("{}", line.green());
-    }
+    print_total_time(start_time);
     println!(
         "{} {}",
         "DuckDB database created at:".green(),
@@ -915,6 +822,27 @@ fn generate_completions(args: CompletionsArgs) {
         Shell::PowerShell => print_completions(Shell::PowerShell),
         Shell::Zsh => print_completions(Shell::Zsh),
         _ => unreachable!("unsupported clap_complete shell variant"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn total_time_line_uses_supplied_finish_time() {
+        let start = Instant::now();
+        let finish = start + Duration::from_millis(49_570);
+
+        assert_eq!(
+            total_time_line(Some(start), finish).as_deref(),
+            Some("Total time: 49.57s")
+        );
+    }
+
+    #[test]
+    fn total_time_line_is_absent_without_start_time() {
+        assert_eq!(total_time_line(None, Instant::now()), None);
     }
 }
 
