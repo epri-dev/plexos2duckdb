@@ -814,6 +814,7 @@ pub struct DuckdbBuilder<'a> {
     dataset: &'a SolutionDataset,
     db_path: std::path::PathBuf,
     data_write_threads: Option<usize>,
+    data_table_name_pattern: Option<regex::Regex>,
     deflate_index_interval_bytes: u64,
     report: Option<&'a mut dyn FnMut(&str)>,
     progress: Option<&'a mut dyn FnMut(ProgressEvent)>,
@@ -825,6 +826,7 @@ impl<'a> DuckdbBuilder<'a> {
             dataset,
             db_path: db_path.as_ref().to_path_buf(),
             data_write_threads: None,
+            data_table_name_pattern: None,
             deflate_index_interval_bytes: DEFAULT_DEFLATE_INDEX_INTERVAL_MIB * MIB_BYTES,
             report: None,
             progress: None,
@@ -833,6 +835,11 @@ impl<'a> DuckdbBuilder<'a> {
 
     pub fn with_data_write_threads(mut self, threads: usize) -> Self {
         self.data_write_threads = Some(threads.max(1));
+        self
+    }
+
+    pub fn with_data_table_name_pattern(mut self, pattern: regex::Regex) -> Self {
+        self.data_table_name_pattern = Some(pattern);
         self
     }
 
@@ -876,6 +883,7 @@ impl<'a> DuckdbBuilder<'a> {
             &self.db_path,
             combined_opt,
             self.data_write_threads,
+            self.data_table_name_pattern.as_ref(),
             self.deflate_index_interval_bytes,
         )
     }
@@ -2043,6 +2051,7 @@ impl SolutionDataset {
         db_path: P,
         mut progress: Option<&mut dyn FnMut(DuckdbProgress)>,
         data_write_threads: Option<usize>,
+        data_table_name_pattern: Option<&regex::Regex>,
         deflate_index_interval_bytes: u64,
     ) -> Result<()> {
         let db_path = db_path.as_ref();
@@ -2267,6 +2276,7 @@ impl SolutionDataset {
                     &mut con,
                     progress,
                     data_write_threads,
+                    data_table_name_pattern,
                     db_path,
                     deflate_index_interval_bytes,
                 )
@@ -2292,7 +2302,7 @@ impl SolutionDataset {
             total_steps,
             "Creating report views",
             |_progress| {
-                self.create_report_views(&mut con)?;
+                self.create_report_views(&mut con, data_table_name_pattern)?;
                 Ok(())
             },
         )?;
@@ -2316,12 +2326,13 @@ impl SolutionDataset {
         con: &mut duckdb::Connection,
         progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
         data_write_threads: Option<usize>,
+        data_table_name_pattern: Option<&regex::Regex>,
         db_path: &std::path::Path,
         deflate_index_interval_bytes: u64,
     ) -> Result<()> {
         con.execute_batch("CREATE SCHEMA IF NOT EXISTS data;")?;
 
-        let plans = self.build_data_table_plans()?;
+        let plans = self.build_data_table_plans(data_table_name_pattern)?;
         let total_tables = plans.len();
         if total_tables == 0 {
             return Ok(());
@@ -2354,9 +2365,26 @@ impl SolutionDataset {
         )
     }
 
-    fn build_data_table_plans(&self) -> Result<Vec<DataTableWritePlan>> {
+    fn data_table_name_matches(
+        table_name: &str,
+        data_table_name_pattern: Option<&regex::Regex>,
+    ) -> bool {
+        match data_table_name_pattern {
+            Some(pattern) => pattern.is_match(table_name),
+            None => true,
+        }
+    }
+
+    fn build_data_table_plans(
+        &self,
+        data_table_name_pattern: Option<&regex::Regex>,
+    ) -> Result<Vec<DataTableWritePlan>> {
         let mut plans = Vec::with_capacity(self.table_key_index_mapping.len());
         for (table_name, key_ids) in self.table_key_index_mapping.iter() {
+            if !Self::data_table_name_matches(table_name, data_table_name_pattern) {
+                continue;
+            }
+
             let mut estimated_values = 0u128;
             for key_id in key_ids.iter().copied() {
                 let length = self.key_index(key_id)?.length;
@@ -2654,15 +2682,21 @@ impl SolutionDataset {
         deflate_index_interval_bytes: u64,
         progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
     ) -> Result<()> {
-        let compressed_indexes = self.build_compressed_period_data_indexes(
-            staging_parent,
-            deflate_index_interval_bytes,
-            progress,
-        )?;
         let tasks = self.build_data_range_write_tasks(&plans)?;
         if tasks.is_empty() {
             return Ok(());
         }
+
+        let mut period_type_ids = std::collections::BTreeSet::new();
+        for task in &tasks {
+            period_type_ids.insert(task.period_type_id);
+        }
+        let compressed_indexes = self.build_compressed_period_data_indexes(
+            staging_parent,
+            deflate_index_interval_bytes,
+            &period_type_ids,
+            progress,
+        )?;
 
         let worker_count = worker_count.min(tasks.len()).max(1);
         let total_ranges = tasks.len();
@@ -2856,12 +2890,14 @@ impl SolutionDataset {
         &self,
         _staging_parent: &std::path::Path,
         interval_bytes: u64,
+        period_type_ids: &std::collections::BTreeSet<i64>,
         progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
     ) -> Result<CompressedDeflateIndexes> {
         let interval_bytes = interval_bytes.max(MIN_DEFLATE_INDEX_INTERVAL_BYTES);
         let compressed_entries: Vec<_> = self
             .period_data
             .iter()
+            .filter(|(period_type_id, _period_data)| period_type_ids.contains(period_type_id))
             .filter_map(|(period_type_id, period_data)| {
                 period_data
                     .compressed_zip_entry()
@@ -3978,10 +4014,18 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn create_report_views(&self, con: &mut duckdb::Connection) -> Result<()> {
+    fn create_report_views(
+        &self,
+        con: &mut duckdb::Connection,
+        data_table_name_pattern: Option<&regex::Regex>,
+    ) -> Result<()> {
         con.execute_batch("CREATE SCHEMA IF NOT EXISTS report;")?;
 
         for table_name in self.table_key_index_mapping.keys() {
+            if !Self::data_table_name_matches(table_name, data_table_name_pattern) {
+                continue;
+            }
+
             let phase_name = table_name
                 .split("__")
                 .next()
