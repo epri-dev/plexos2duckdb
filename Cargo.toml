@@ -22,7 +22,6 @@ indexmap = "2.14.0"
 indicatif = "0.18.4"
 itertools = "0.14.0"
 lazy_static = "1.5.0"
-miniz_oxide = { version = "0.9.1", features = ["block-boundary"] }
 owo-colors = "4.3.0"
 parquet = { version = "58.2.0", default-features = false, features = ["arrow", "snap"] }
 regex = "1.12.3"
