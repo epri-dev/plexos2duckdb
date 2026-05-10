@@ -243,6 +243,26 @@ fn fetch_table_names(con: &Connection, schema: &str, table_type: &str) -> Vec<St
     .expect("collect table names")
 }
 
+fn count_parquet_files(path: &Path) -> usize {
+    let mut count = 0usize;
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        for entry in std::fs::read_dir(path).expect("read parquet directory") {
+            let entry = entry.expect("read parquet directory entry");
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("parquet"))
+            {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
 fn fetch_column_names(con: &Connection, schema: &str, table: &str) -> Vec<String> {
     con.prepare(
         "SELECT column_name FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position",
@@ -425,6 +445,103 @@ fn day_ahead_database_matches_detailed_schema_expectations() {
         rows.next().expect("read report row").is_some(),
         "expected report view to return at least one row"
     );
+}
+
+#[test]
+fn convert_external_data_parquet_dir_creates_parquet_backed_data_views() {
+    let fixture_name = "Model_Base_LT_Solution.zip";
+    let fixture_dir = fixture_dir();
+    let temp_dir = temp_dir();
+    let source_path = fixture_dir.join(fixture_name);
+    let output_path = generated_output_path(&temp_dir, fixture_name);
+    let external_dir = temp_dir.path().join("external-data");
+    let external_dir_arg = external_dir
+        .to_str()
+        .expect("external path utf8")
+        .to_string();
+
+    run_convert_with_args(
+        &source_path,
+        &output_path,
+        &[
+            "--table-name-pattern",
+            "^LT__Interval__Batteries__(Generation|Load)$",
+            "--external-data-parquet-dir",
+            external_dir_arg.as_str(),
+        ],
+    );
+
+    assert!(
+        external_dir.join("data").is_dir(),
+        "expected external data directory at {}",
+        external_dir.join("data").display()
+    );
+    assert!(
+        count_parquet_files(&external_dir) == 2,
+        "expected external parquet files under {}",
+        external_dir.display()
+    );
+    for table in [
+        "LT__Interval__Batteries__Generation",
+        "LT__Interval__Batteries__Load",
+    ] {
+        let expected_parquet_path = external_dir
+            .join("data")
+            .join(table)
+            .join(format!("{table}.part-00001.parquet"));
+        assert!(
+            expected_parquet_path.exists(),
+            "expected external parquet file at {}",
+            expected_parquet_path.display()
+        );
+    }
+
+    let con = open_connection(&output_path);
+    let expected_tables = vec![
+        "LT__Interval__Batteries__Generation".to_string(),
+        "LT__Interval__Batteries__Load".to_string(),
+    ];
+    assert_eq!(
+        fetch_table_names(&con, "data", "BASE TABLE"),
+        Vec::<String>::new(),
+        "external parquet mode should not materialize data base tables",
+    );
+    assert_eq!(
+        fetch_table_names(&con, "data", "VIEW"),
+        expected_tables,
+        "unexpected external data view set",
+    );
+    assert_eq!(
+        fetch_table_names(&con, "report", "VIEW"),
+        expected_tables,
+        "unexpected filtered report view set",
+    );
+
+    let root: String = con
+        .query_row(
+            "SELECT main.plexos2duckdb_external_data_root()",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read external data root macro");
+    assert_eq!(
+        root,
+        external_dir
+            .canonicalize()
+            .expect("canonical external path")
+            .to_string_lossy()
+            .replace('\\', "/"),
+        "unexpected external data root macro value",
+    );
+
+    let count: i64 = con
+        .query_row(
+            "SELECT COUNT(*) FROM data.\"LT__Interval__Batteries__Generation\"",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count external data view rows");
+    assert_eq!(count, 144, "unexpected external data view row count");
 }
 
 #[test]
