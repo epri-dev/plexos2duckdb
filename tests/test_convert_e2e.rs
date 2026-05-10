@@ -5,7 +5,7 @@ use std::{
 };
 
 use duckdb::Connection;
-use rstest::{fixture, rstest};
+use rstest::fixture;
 
 const EXPECTED_DATA_COLUMNS: &[&str] = &[
     "key_id",
@@ -48,6 +48,12 @@ const EXPECTED_REPORT_PREFIX_COLUMNS: &[&str] = &[
     "category",
     "timestamp",
     "interval_length",
+];
+const DETAILED_FIXTURE_NAMES: &[&str] = &[
+    "Model DAY_AHEAD Solution.zip",
+    "Model_Base_LT_Solution.zip",
+    "Model_Base_Solution.zip",
+    "Model_Base_ST_Solution.zip",
 ];
 
 const EXPECTED_SCHEMAS: &[&str] = &["data", "main", "processed", "raw", "report"];
@@ -176,6 +182,19 @@ fn generated_output_path(temp_dir: &tempfile::TempDir, fixture_name: &str) -> Pa
     temp_dir
         .path()
         .join(format!("{}.duckdb", fixture_name.replace(' ', "_")))
+}
+
+fn solution_zip_fixture_paths(fixture_dir: &Path) -> Vec<PathBuf> {
+    let mut paths = std::fs::read_dir(fixture_dir)
+        .expect("read fixture directory")
+        .map(|entry| entry.expect("read fixture directory entry").path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+        })
+        .collect::<Vec<_>>();
+    paths.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+    paths
 }
 
 fn run_convert(source_path: &Path, output_path: &Path) {
@@ -343,21 +362,36 @@ fn assert_report_view_shape(con: &Connection, view_name: &str, metric_name: &str
     );
 }
 
-#[rstest]
-#[case("Model DAY_AHEAD Solution.zip")]
-#[case("Model_Base_LT_Solution.zip")]
-#[case("Model_Base_Solution.zip")]
-#[case("Model_Base_ST_Solution.zip")]
-fn convert_end_to_end_for_solution_fixture(
-    fixture_dir: PathBuf,
-    temp_dir: tempfile::TempDir,
-    #[case] fixture_name: &str,
-) {
-    let source_path = fixture_dir.join(fixture_name);
-    let output_path = generated_output_path(&temp_dir, fixture_name);
+#[test]
+fn additional_solution_zip_fixtures_convert_end_to_end() {
+    let fixture_dir = fixture_dir();
+    let temp_dir = temp_dir();
+    let fixture_paths = solution_zip_fixture_paths(&fixture_dir)
+        .into_iter()
+        .filter(|path| {
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("fixture file name utf8");
+            !DETAILED_FIXTURE_NAMES.contains(&file_name)
+        })
+        .collect::<Vec<_>>();
 
-    run_convert(&source_path, &output_path);
-    assert_database_basics(&output_path, &source_path);
+    assert!(
+        !fixture_paths.is_empty(),
+        "expected at least one additional ZIP fixture"
+    );
+
+    for source_path in fixture_paths {
+        let fixture_name = source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("fixture file name utf8");
+        let output_path = generated_output_path(&temp_dir, fixture_name);
+
+        run_convert(&source_path, &output_path);
+        assert_database_basics(&output_path, &source_path);
+    }
 }
 
 #[test]
