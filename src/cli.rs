@@ -60,6 +60,9 @@ pub struct ConvertArgs {
     /// Regex matched against generated data table names; defaults to all tables
     #[arg(long)]
     pub table_name_pattern: Option<String>,
+    /// Write time series data as external Parquet files and create DuckDB views over them
+    #[arg(long)]
+    pub external_data_parquet_dir: Option<std::path::PathBuf>,
     /// Output format for diagnostics and results
     #[arg(long = "format-diagnostics", value_enum, default_value_t = OutputFormat::Text)]
     pub format_diagnostics: OutputFormat,
@@ -761,6 +764,9 @@ fn convert(args: ConvertArgs) -> Result<()> {
     }
     if let Some(pattern) = table_name_pattern {
         builder = builder.with_data_table_name_pattern(pattern);
+    }
+    if let Some(path) = args.external_data_parquet_dir.as_ref() {
+        builder = builder.with_external_data_parquet_dir(path);
     }
     let builder = if json_mode || !args.no_progress_bar {
         builder

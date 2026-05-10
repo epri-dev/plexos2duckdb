@@ -663,6 +663,7 @@ pub struct DuckdbBuilder<'a> {
     db_path: std::path::PathBuf,
     data_write_threads: Option<usize>,
     data_table_name_pattern: Option<regex::Regex>,
+    external_data_parquet_dir: Option<std::path::PathBuf>,
     report: Option<&'a mut dyn FnMut(&str)>,
     progress: Option<&'a mut dyn FnMut(ProgressEvent)>,
 }
@@ -674,6 +675,7 @@ impl<'a> DuckdbBuilder<'a> {
             db_path: db_path.as_ref().to_path_buf(),
             data_write_threads: None,
             data_table_name_pattern: None,
+            external_data_parquet_dir: None,
             report: None,
             progress: None,
         }
@@ -686,6 +688,11 @@ impl<'a> DuckdbBuilder<'a> {
 
     pub fn with_data_table_name_pattern(mut self, pattern: regex::Regex) -> Self {
         self.data_table_name_pattern = Some(pattern);
+        self
+    }
+
+    pub fn with_external_data_parquet_dir<P: AsRef<std::path::Path>>(mut self, path: P) -> Self {
+        self.external_data_parquet_dir = Some(path.as_ref().to_path_buf());
         self
     }
 
@@ -725,6 +732,7 @@ impl<'a> DuckdbBuilder<'a> {
             combined_opt,
             self.data_write_threads,
             self.data_table_name_pattern.as_ref(),
+            self.external_data_parquet_dir.as_deref(),
         )
     }
 }
@@ -1887,6 +1895,7 @@ impl SolutionDataset {
         mut progress: Option<&mut dyn FnMut(DuckdbProgress)>,
         data_write_threads: Option<usize>,
         data_table_name_pattern: Option<&regex::Regex>,
+        external_data_parquet_dir: Option<&std::path::Path>,
     ) -> Result<()> {
         let db_path = db_path.as_ref();
         let total_steps = 28;
@@ -2112,6 +2121,7 @@ impl SolutionDataset {
                     data_write_threads,
                     data_table_name_pattern,
                     db_path,
+                    external_data_parquet_dir,
                 )
             },
         )?;
@@ -2161,6 +2171,7 @@ impl SolutionDataset {
         data_write_threads: Option<usize>,
         data_table_name_pattern: Option<&regex::Regex>,
         db_path: &std::path::Path,
+        external_data_parquet_dir: Option<&std::path::Path>,
     ) -> Result<()> {
         con.execute_batch("CREATE SCHEMA IF NOT EXISTS data;")?;
 
@@ -2170,11 +2181,16 @@ impl SolutionDataset {
             return Ok(());
         }
 
-        for plan in &plans {
-            self.create_data_table(con, plan.table_name.as_str())?;
+        if external_data_parquet_dir.is_none() {
+            for plan in &plans {
+                self.create_data_table(con, plan.table_name.as_str())?;
+            }
         }
 
         let staging_parent = Self::duckdb_staging_parent(db_path);
+        let external_data_parquet_dir = external_data_parquet_dir
+            .map(|path| Self::resolve_external_data_parquet_dir(db_path, path))
+            .transpose()?;
         let materialized_period_data = self.materialize_compressed_period_data_for_plans(
             &plans,
             staging_parent.as_path(),
@@ -2187,6 +2203,7 @@ impl SolutionDataset {
             plans,
             worker_count,
             staging_parent.as_path(),
+            external_data_parquet_dir.as_deref(),
             materialized_period_data.as_ref(),
             progress,
         )
@@ -2332,6 +2349,7 @@ impl SolutionDataset {
         plans: Vec<DataTableWritePlan>,
         worker_count: usize,
         staging_parent: &std::path::Path,
+        external_data_parquet_dir: Option<&std::path::Path>,
         materialized_period_data: Option<&MaterializedPeriodDataFiles>,
         progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
     ) -> Result<()> {
@@ -2345,14 +2363,30 @@ impl SolutionDataset {
             ),
         );
 
-        let staging_dir = tempfile::Builder::new()
-            .prefix("plexos2duckdb-data-parquet-")
-            .tempdir_in(staging_parent)?;
+        let mut staging_dir = None;
+        let (parquet_root, external_layout) = if let Some(external_dir) = external_data_parquet_dir
+        {
+            std::fs::create_dir_all(external_dir)?;
+            let external_dir = external_dir.canonicalize()?;
+            std::fs::create_dir_all(external_dir.join("data"))?;
+            (external_dir, true)
+        } else {
+            let dir = tempfile::Builder::new()
+                .prefix("plexos2duckdb-data-parquet-")
+                .tempdir_in(staging_parent)?;
+            let path = dir.path().to_path_buf();
+            staging_dir = Some(dir);
+            (path, false)
+        };
         let (tx, rx) = std::sync::mpsc::channel::<DataWriteWorkerEvent>();
         let staged_files = std::thread::scope(|scope| -> Result<Vec<StagedDataFiles>> {
             let mut handles = Vec::with_capacity(worker_plans.len());
             for (worker_idx, worker_plan) in worker_plans.into_iter().enumerate() {
-                let worker_dir = staging_dir.path().join(format!("data_worker_{worker_idx}"));
+                let worker_dir = if external_layout {
+                    parquet_root.join("data")
+                } else {
+                    parquet_root.join(format!("data_worker_{worker_idx}"))
+                };
                 let worker_tx = tx.clone();
 
                 handles.push(scope.spawn(move || -> Result<StagedDataFiles> {
@@ -2361,6 +2395,7 @@ impl SolutionDataset {
                         worker_idx,
                         worker_plan,
                         &worker_dir,
+                        external_layout,
                         materialized_period_data,
                         &worker_tx,
                     )?;
@@ -2449,8 +2484,14 @@ impl SolutionDataset {
             Ok(staged_files)
         })?;
 
-        Self::report_duckdb_progress(progress, "Merging staged parquet files");
-        self.merge_staged_data_files(con, &staged_files, progress)?;
+        if external_layout {
+            Self::report_duckdb_progress(progress, "Creating external parquet data views");
+            self.create_external_parquet_data_views(con, &parquet_root, &staged_files, progress)?;
+        } else {
+            Self::report_duckdb_progress(progress, "Merging staged parquet files");
+            self.merge_staged_data_files(con, &staged_files, progress)?;
+        }
+        drop(staging_dir);
         Ok(())
     }
 
@@ -2482,6 +2523,7 @@ impl SolutionDataset {
         worker_idx: usize,
         worker_plan: Vec<DataTableWritePlan>,
         worker_dir: &std::path::Path,
+        external_layout: bool,
         materialized_period_data: Option<&MaterializedPeriodDataFiles>,
         worker_tx: &std::sync::mpsc::Sender<DataWriteWorkerEvent>,
     ) -> Result<std::collections::BTreeMap<String, Vec<std::path::PathBuf>>> {
@@ -2500,7 +2542,14 @@ impl SolutionDataset {
                 keys,
             });
 
-            let parquet_path = worker_dir.join(format!("table_{worker_table_index:05}.parquet"));
+            let parquet_path = if external_layout {
+                let table_dir_name = Self::external_data_table_dir_name(&table_name);
+                let table_dir = worker_dir.join(&table_dir_name);
+                std::fs::create_dir_all(&table_dir)?;
+                table_dir.join(format!("{table_dir_name}.part-00001.parquet"))
+            } else {
+                worker_dir.join(format!("table_{worker_table_index:05}.parquet"))
+            };
             let mut writer = Self::open_data_parquet_writer(&parquet_path)?;
             self.write_data_table_to_parquet(&mut writer, &table_plan, materialized_period_data)?;
             writer.close()?;
@@ -2560,7 +2609,7 @@ impl SolutionDataset {
     fn open_data_parquet_writer(path: &std::path::Path) -> Result<ArrowWriter<std::fs::File>> {
         let file = std::fs::File::create(path)?;
         let writer_properties = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
+            .set_compression(Compression::UNCOMPRESSED)
             .set_max_row_group_row_count(Some(DATA_APPEND_BATCH_VALUES as usize))
             .build();
         Ok(ArrowWriter::try_new(
@@ -2719,16 +2768,7 @@ impl SolutionDataset {
     ) -> Result<()> {
         let target_catalog = Self::current_catalog_name(con)?;
         let target_catalog_ident = Self::quote_ident(&target_catalog);
-        let mut files_by_table =
-            std::collections::BTreeMap::<String, Vec<std::path::PathBuf>>::new();
-        for staged_file_set in staged_files {
-            for (table_name, files) in &staged_file_set.table_files {
-                files_by_table
-                    .entry(table_name.clone())
-                    .or_default()
-                    .extend(files.iter().cloned());
-            }
-        }
+        let files_by_table = Self::staged_files_by_table(staged_files);
         let total_merges = files_by_table.len();
 
         for (table_idx, (table_name, files)) in files_by_table.into_iter().enumerate() {
@@ -2758,6 +2798,65 @@ impl SolutionDataset {
         }
 
         Ok(())
+    }
+
+    fn create_external_parquet_data_views(
+        &self,
+        con: &mut duckdb::Connection,
+        parquet_root: &std::path::Path,
+        staged_files: &[StagedDataFiles],
+        progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
+        let root = Self::path_string(parquet_root);
+        con.execute_batch(&format!(
+            "CREATE OR REPLACE MACRO main.plexos2duckdb_external_data_root() AS '{}';",
+            Self::sql_string_literal(&root)
+        ))?;
+
+        let files_by_table = Self::staged_files_by_table(staged_files);
+        let total_views = files_by_table.len();
+        for (table_idx, (table_name, files)) in files_by_table.into_iter().enumerate() {
+            let view_index = table_idx + 1;
+            if let Some(report) = progress.as_mut() {
+                report(DuckdbProgress::Event(ProgressEvent::DataMergeTableStart {
+                    index: view_index,
+                    total: total_views,
+                    table_name: table_name.clone(),
+                }));
+            }
+
+            let table_ident = Self::quote_ident(&table_name);
+            let parquet_paths = Self::external_parquet_path_expr_list(parquet_root, &files)?;
+            con.execute_batch(&format!(
+                "CREATE OR REPLACE VIEW data.{table_ident} AS
+                 SELECT * FROM read_parquet({parquet_paths});"
+            ))?;
+
+            if let Some(report) = progress.as_mut() {
+                report(DuckdbProgress::Event(ProgressEvent::DataMergeTableEnd {
+                    index: view_index,
+                    total: total_views,
+                }));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn staged_files_by_table(
+        staged_files: &[StagedDataFiles],
+    ) -> std::collections::BTreeMap<String, Vec<std::path::PathBuf>> {
+        let mut files_by_table =
+            std::collections::BTreeMap::<String, Vec<std::path::PathBuf>>::new();
+        for staged_file_set in staged_files {
+            for (table_name, files) in &staged_file_set.table_files {
+                files_by_table
+                    .entry(table_name.clone())
+                    .or_default()
+                    .extend(files.iter().cloned());
+            }
+        }
+        files_by_table
     }
 
     fn create_data_table(&self, con: &mut duckdb::Connection, table_name: &str) -> Result<()> {
@@ -2791,6 +2890,68 @@ impl SolutionDataset {
             sql_values.push(format!("'{}'", Self::sql_string_literal(&value)));
         }
         format!("[{}]", sql_values.join(", "))
+    }
+
+    fn external_parquet_path_expr_list(
+        parquet_root: &std::path::Path,
+        files: &[std::path::PathBuf],
+    ) -> Result<String> {
+        let mut sql_values = Vec::new();
+        for file in files {
+            let relative_path = file.strip_prefix(parquet_root).map_err(|err| {
+                eyre!(
+                    "External parquet file '{}' is not under root '{}': {}",
+                    file.display(),
+                    parquet_root.display(),
+                    err
+                )
+            })?;
+            let relative_path = Self::path_string(relative_path);
+            sql_values.push(format!(
+                "main.plexos2duckdb_external_data_root() || '/{}'",
+                Self::sql_string_literal(&relative_path)
+            ));
+        }
+        Ok(format!("[{}]", sql_values.join(", ")))
+    }
+
+    fn external_data_table_dir_name(table_name: &str) -> String {
+        let mut dir_name = String::with_capacity(table_name.len());
+        for byte in table_name.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.' => {
+                    dir_name.push(byte as char);
+                },
+                _ => {
+                    dir_name.push_str(&format!("%{byte:02X}"));
+                },
+            }
+        }
+        if dir_name.is_empty() {
+            "_".to_string()
+        } else {
+            dir_name
+        }
+    }
+
+    fn resolve_external_data_parquet_dir(
+        db_path: &std::path::Path,
+        parquet_dir: &std::path::Path,
+    ) -> Result<std::path::PathBuf> {
+        if parquet_dir.is_absolute() {
+            return Ok(parquet_dir.to_path_buf());
+        }
+        let db_parent = db_path.parent().ok_or_else(|| {
+            eyre!(
+                "Could not resolve parent directory for DuckDB path '{}'",
+                db_path.display()
+            )
+        })?;
+        Ok(db_parent.join(parquet_dir))
+    }
+
+    fn path_string(path: &std::path::Path) -> String {
+        path.to_string_lossy().replace('\\', "/")
     }
 
     fn current_catalog_name(con: &duckdb::Connection) -> Result<String> {
