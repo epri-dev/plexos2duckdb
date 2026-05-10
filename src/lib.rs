@@ -13,15 +13,9 @@ use duckdb::arrow::{
 use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
 use roxmltree::{Document, Node};
 
-mod deflate_index;
 pub mod utils;
 
-pub const DEFAULT_DEFLATE_INDEX_INTERVAL_MIB: u64 = 64;
-
 const DATA_APPEND_BATCH_VALUES: u64 = 262_144;
-const DATA_RANGE_TASK_VALUES: u64 = 8_388_608;
-const MIB_BYTES: u64 = 1024 * 1024;
-const MIN_DEFLATE_INDEX_INTERVAL_BYTES: u64 = MIB_BYTES;
 
 static DATA_RECORD_BATCH_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
@@ -396,152 +390,40 @@ impl ZipPeriodData {
     }
 }
 
-#[derive(Debug, Clone)]
-struct ZipMemberReader {
-    archive_file: Arc<std::fs::File>,
-    data_start: u64,
-    compressed_len: u64,
-    position: u64,
-}
-
-impl ZipMemberReader {
-    fn new(archive_file: Arc<std::fs::File>, data_start: u64, compressed_len: u64) -> Self {
-        Self {
-            archive_file,
-            data_start,
-            compressed_len,
-            position: 0,
-        }
-    }
-}
-
-impl std::io::Read for ZipMemberReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if buf.is_empty() || self.position >= self.compressed_len {
-            return Ok(0);
-        }
-
-        let remaining = self.compressed_len - self.position;
-        let read_len = remaining.min(buf.len() as u64) as usize;
-        let archive_offset = self.data_start.checked_add(self.position).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "archive read offset overflow",
-            )
-        })?;
-        SolutionDataset::read_exact_at(&self.archive_file, archive_offset, &mut buf[..read_len])?;
-        self.position = self.position.checked_add(read_len as u64).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "ZIP member position overflow",
-            )
-        })?;
-        Ok(read_len)
-    }
-}
-
-impl std::io::Seek for ZipMemberReader {
-    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        let next = match pos {
-            std::io::SeekFrom::Start(offset) => i128::from(offset),
-            std::io::SeekFrom::End(offset) => i128::from(self.compressed_len) + i128::from(offset),
-            std::io::SeekFrom::Current(offset) => i128::from(self.position) + i128::from(offset),
-        };
-
-        if next < 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "cannot seek before ZIP member start",
-            ));
-        }
-
-        self.position = u64::try_from(next).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "ZIP member seek offset exceeds u64",
-            )
-        })?;
-        Ok(self.position)
-    }
-}
-
 #[derive(Debug)]
 struct CompressedZipPeriodData {
     archive_file: Arc<std::fs::File>,
-    data_start: u64,
-    compressed_len: u64,
     data_len: u64,
     name: String,
 }
 
 impl CompressedZipPeriodData {
-    fn compressed_reader(&self) -> ZipMemberReader {
-        ZipMemberReader::new(
-            self.archive_file.clone(),
-            self.data_start,
-            self.compressed_len,
-        )
-    }
-
-    fn build_deflate_index(&self, interval_bytes: u64) -> Result<CompressedDeflateIndex> {
-        let interval_bytes = interval_bytes.max(MIN_DEFLATE_INDEX_INTERVAL_BYTES);
-        let index = deflate_index::DeflateIndex::build(
-            self.compressed_reader(),
-            self.data_len,
-            interval_bytes,
-        )?;
-        Ok(CompressedDeflateIndex { index })
-    }
-
-    fn read_exact_at_with_index(
-        &self,
-        index: &CompressedDeflateIndex,
-        offset: u64,
-        buf: &mut [u8],
-    ) -> Result<()> {
-        index
-            .index
-            .read_exact_at(self.compressed_reader(), offset, buf)?;
-        Ok(())
-    }
-
-    fn indexed_reader<'a>(
-        &self,
-        index: &'a CompressedDeflateIndex,
-        offset: u64,
-    ) -> std::io::Result<deflate_index::DeflateIndexedReader<'a, ZipMemberReader>> {
-        index.index.indexed_reader(self.compressed_reader(), offset)
-    }
-
     fn read_exact_at(&self, _offset: u64, _buf: &mut [u8]) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "compressed ZIP period data requires a deflate seek index",
+            "compressed ZIP period data must be materialized before reading",
         ))
     }
-}
 
-#[derive(Debug, Clone)]
-struct CompressedDeflateIndex {
-    index: deflate_index::DeflateIndex,
-}
-
-#[derive(Debug)]
-struct CompressedDeflateIndexes {
-    by_period_type_id: DeflateIndexMap,
-}
-
-impl CompressedDeflateIndexes {
-    fn get(&self, period_type_id: i64) -> Option<&CompressedDeflateIndex> {
-        self.by_period_type_id
-            .get(&period_type_id)
-            .map(std::convert::AsRef::as_ref)
+    fn materialize_to(&self, path: &std::path::Path) -> Result<()> {
+        let mut archive = zip::ZipArchive::new(self.archive_file.try_clone()?)?;
+        let mut file = archive.by_name(&self.name)?;
+        let mut output = std::fs::File::create(path)?;
+        let copied = std::io::copy(&mut file, &mut output)?;
+        if copied != self.data_len {
+            return Err(eyre!(
+                "Materialized BIN file '{}' length mismatch: ZIP directory says {} bytes, copied {} bytes",
+                self.name,
+                self.data_len,
+                copied
+            ));
+        }
+        Ok(())
     }
 }
 
 #[derive(Debug, Clone)]
 struct DataRangeWriteTask {
-    table_name: String,
     key_id: i64,
     sample_id: i64,
     band_id: i64,
@@ -556,24 +438,6 @@ struct DataRangeWriteTask {
 #[derive(Debug)]
 struct StagedDataFiles {
     table_files: std::collections::BTreeMap<String, Vec<std::path::PathBuf>>,
-}
-
-#[derive(Debug)]
-enum DataRangeWriteWorkerEvent {
-    RangeStarted {
-        worker_id: usize,
-        index: usize,
-        total: usize,
-        table_name: String,
-        key_id: i64,
-        start_value: u64,
-        values: u64,
-    },
-    RangeCompleted {
-        worker_id: usize,
-        index: usize,
-        total: usize,
-    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -619,27 +483,19 @@ impl PeriodData {
     }
 }
 
-type DeflateIndexMap = std::collections::HashMap<i64, Arc<CompressedDeflateIndex>>;
-
-impl DataRangeWriteTask {
-    fn estimated_values(&self) -> u128 {
-        u128::from(self.value_count)
-    }
-}
-
 impl StagedDataFiles {
     fn new(table_files: std::collections::BTreeMap<String, Vec<std::path::PathBuf>>) -> Self {
         Self { table_files }
     }
 }
 
-impl DataRangeWriteWorkerEvent {
-    fn completed(worker_id: usize, index: usize, total: usize) -> Self {
-        Self::RangeCompleted {
-            worker_id,
-            index,
-            total,
-        }
+impl MaterializedPeriodDataFiles {
+    fn new(dir: tempfile::TempDir, files: std::collections::BTreeMap<i64, std::fs::File>) -> Self {
+        Self { _dir: dir, files }
+    }
+
+    fn get(&self, period_type_id: i64) -> Option<&std::fs::File> {
+        self.files.get(&period_type_id)
     }
 }
 
@@ -754,20 +610,6 @@ pub enum ProgressEvent {
         index: usize,
         total: usize,
     },
-    DataWorkerRangeStart {
-        worker_id: usize,
-        index: usize,
-        total: usize,
-        table_name: String,
-        key_id: i64,
-        start_value: u64,
-        values: u64,
-    },
-    DataWorkerRangeEnd {
-        worker_id: usize,
-        index: usize,
-        total: usize,
-    },
     DataMergeTableStart {
         index: usize,
         total: usize,
@@ -793,6 +635,12 @@ struct DataTableWritePlan {
 }
 
 #[derive(Debug)]
+struct MaterializedPeriodDataFiles {
+    _dir: tempfile::TempDir,
+    files: std::collections::BTreeMap<i64, std::fs::File>,
+}
+
+#[derive(Debug)]
 enum DataWriteWorkerEvent {
     TableStarted {
         worker_id: usize,
@@ -815,7 +663,6 @@ pub struct DuckdbBuilder<'a> {
     db_path: std::path::PathBuf,
     data_write_threads: Option<usize>,
     data_table_name_pattern: Option<regex::Regex>,
-    deflate_index_interval_bytes: u64,
     report: Option<&'a mut dyn FnMut(&str)>,
     progress: Option<&'a mut dyn FnMut(ProgressEvent)>,
 }
@@ -827,7 +674,6 @@ impl<'a> DuckdbBuilder<'a> {
             db_path: db_path.as_ref().to_path_buf(),
             data_write_threads: None,
             data_table_name_pattern: None,
-            deflate_index_interval_bytes: DEFAULT_DEFLATE_INDEX_INTERVAL_MIB * MIB_BYTES,
             report: None,
             progress: None,
         }
@@ -840,11 +686,6 @@ impl<'a> DuckdbBuilder<'a> {
 
     pub fn with_data_table_name_pattern(mut self, pattern: regex::Regex) -> Self {
         self.data_table_name_pattern = Some(pattern);
-        self
-    }
-
-    pub fn with_deflate_index_interval_bytes(mut self, bytes: u64) -> Self {
-        self.deflate_index_interval_bytes = bytes.max(MIN_DEFLATE_INDEX_INTERVAL_BYTES);
         self
     }
 
@@ -884,7 +725,6 @@ impl<'a> DuckdbBuilder<'a> {
             combined_opt,
             self.data_write_threads,
             self.data_table_name_pattern.as_ref(),
-            self.deflate_index_interval_bytes,
         )
     }
 }
@@ -1117,19 +957,14 @@ impl SolutionDataset {
 
                 if file.compression() != zip::CompressionMethod::Deflated {
                     return Err(eyre!(
-                        "BIN file '{}' uses unsupported ZIP compression method {:?}; only stored and deflated BIN entries can be converted without buffering",
+                        "BIN file '{}' uses unsupported ZIP compression method {:?}; only stored and deflated BIN entries can be converted",
                         name,
                         file.compression()
                     ));
                 }
 
-                let data_start = file
-                    .data_start()
-                    .ok_or_else(|| eyre!("ZIP entry '{}' is missing a data start offset", name))?;
                 let entry = CompressedZipPeriodData {
                     archive_file: archive_file.clone(),
-                    data_start,
-                    compressed_len: file.compressed_size(),
                     data_len: file.size(),
                     name,
                 };
@@ -2052,7 +1887,6 @@ impl SolutionDataset {
         mut progress: Option<&mut dyn FnMut(DuckdbProgress)>,
         data_write_threads: Option<usize>,
         data_table_name_pattern: Option<&regex::Regex>,
-        deflate_index_interval_bytes: u64,
     ) -> Result<()> {
         let db_path = db_path.as_ref();
         let total_steps = 28;
@@ -2278,7 +2112,6 @@ impl SolutionDataset {
                     data_write_threads,
                     data_table_name_pattern,
                     db_path,
-                    deflate_index_interval_bytes,
                 )
             },
         )?;
@@ -2328,7 +2161,6 @@ impl SolutionDataset {
         data_write_threads: Option<usize>,
         data_table_name_pattern: Option<&regex::Regex>,
         db_path: &std::path::Path,
-        deflate_index_interval_bytes: u64,
     ) -> Result<()> {
         con.execute_batch("CREATE SCHEMA IF NOT EXISTS data;")?;
 
@@ -2343,17 +2175,11 @@ impl SolutionDataset {
         }
 
         let staging_parent = Self::duckdb_staging_parent(db_path);
-        if self.has_compressed_period_data() {
-            let range_worker_count = Self::resolve_data_range_write_threads(data_write_threads);
-            return self.populate_table_data_indexed_ranges(
-                con,
-                plans,
-                range_worker_count,
-                staging_parent.as_path(),
-                deflate_index_interval_bytes,
-                progress,
-            );
-        }
+        let materialized_period_data = self.materialize_compressed_period_data_for_plans(
+            &plans,
+            staging_parent.as_path(),
+            progress,
+        )?;
 
         let worker_count = Self::resolve_data_write_threads(total_tables, data_write_threads);
         self.populate_table_data_uncompressed_parquet(
@@ -2361,6 +2187,7 @@ impl SolutionDataset {
             plans,
             worker_count,
             staging_parent.as_path(),
+            materialized_period_data.as_ref(),
             progress,
         )
     }
@@ -2427,22 +2254,76 @@ impl SolutionDataset {
         }
     }
 
-    fn resolve_data_range_write_threads(configured_threads: Option<usize>) -> usize {
-        const MAX_AUTO_DATA_RANGE_WRITE_THREADS: usize = 16;
+    fn compressed_period_type_ids_for_plans(
+        &self,
+        plans: &[DataTableWritePlan],
+    ) -> Result<std::collections::BTreeSet<i64>> {
+        let mut period_type_ids = std::collections::BTreeSet::new();
 
-        match configured_threads {
-            Some(threads) => threads.max(1),
-            None => std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-                .min(MAX_AUTO_DATA_RANGE_WRITE_THREADS),
+        for plan in plans {
+            for key_id in plan.key_ids.iter().copied() {
+                let ki = self.key_index(key_id)?;
+                let period_data = self
+                    .period_data
+                    .get(&ki.period_type_id)
+                    .ok_or_else(|| eyre!("period type not found: {}", ki.period_type_id))?;
+                if period_data.is_compressed_zip_entry() {
+                    period_type_ids.insert(ki.period_type_id);
+                }
+            }
         }
+
+        Ok(period_type_ids)
     }
 
-    fn has_compressed_period_data(&self) -> bool {
-        self.period_data
-            .values()
-            .any(PeriodData::is_compressed_zip_entry)
+    fn materialize_compressed_period_data_for_plans(
+        &self,
+        plans: &[DataTableWritePlan],
+        staging_parent: &std::path::Path,
+        progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<Option<MaterializedPeriodDataFiles>> {
+        let period_type_ids = self.compressed_period_type_ids_for_plans(plans)?;
+        if period_type_ids.is_empty() {
+            return Ok(None);
+        }
+
+        let materialized_dir = tempfile::Builder::new()
+            .prefix("plexos2duckdb-bin-")
+            .tempdir_in(staging_parent)?;
+        let mut files = std::collections::BTreeMap::new();
+        let total_periods = period_type_ids.len();
+
+        for (idx, period_type_id) in period_type_ids.into_iter().enumerate() {
+            let period_data = self
+                .period_data
+                .get(&period_type_id)
+                .ok_or_else(|| eyre!("period type not found: {}", period_type_id))?;
+            let entry = period_data.compressed_zip_entry().ok_or_else(|| {
+                eyre!(
+                    "period type {} was expected to be compressed ZIP data",
+                    period_type_id
+                )
+            })?;
+            Self::report_duckdb_progress(
+                progress,
+                &format!(
+                    "Materializing compressed BIN file {} ({}/{})",
+                    entry.name,
+                    idx + 1,
+                    total_periods
+                ),
+            );
+            let materialized_path = materialized_dir
+                .path()
+                .join(format!("t_data_{period_type_id}.BIN"));
+            entry.materialize_to(&materialized_path)?;
+            files.insert(period_type_id, std::fs::File::open(&materialized_path)?);
+        }
+
+        Ok(Some(MaterializedPeriodDataFiles::new(
+            materialized_dir,
+            files,
+        )))
     }
 
     fn populate_table_data_uncompressed_parquet(
@@ -2451,6 +2332,7 @@ impl SolutionDataset {
         plans: Vec<DataTableWritePlan>,
         worker_count: usize,
         staging_parent: &std::path::Path,
+        materialized_period_data: Option<&MaterializedPeriodDataFiles>,
         progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
     ) -> Result<()> {
         let total_tables = plans.len();
@@ -2479,6 +2361,7 @@ impl SolutionDataset {
                         worker_idx,
                         worker_plan,
                         &worker_dir,
+                        materialized_period_data,
                         &worker_tx,
                     )?;
                     Ok(StagedDataFiles::new(table_files))
@@ -2599,6 +2482,7 @@ impl SolutionDataset {
         worker_idx: usize,
         worker_plan: Vec<DataTableWritePlan>,
         worker_dir: &std::path::Path,
+        materialized_period_data: Option<&MaterializedPeriodDataFiles>,
         worker_tx: &std::sync::mpsc::Sender<DataWriteWorkerEvent>,
     ) -> Result<std::collections::BTreeMap<String, Vec<std::path::PathBuf>>> {
         let worker_total = worker_plan.len();
@@ -2618,7 +2502,7 @@ impl SolutionDataset {
 
             let parquet_path = worker_dir.join(format!("table_{worker_table_index:05}.parquet"));
             let mut writer = Self::open_data_parquet_writer(&parquet_path)?;
-            self.write_data_table_to_parquet(&mut writer, &table_plan)?;
+            self.write_data_table_to_parquet(&mut writer, &table_plan, materialized_period_data)?;
             writer.close()?;
 
             table_files
@@ -2642,6 +2526,7 @@ impl SolutionDataset {
         &self,
         writer: &mut ArrowWriter<std::fs::File>,
         plan: &DataTableWritePlan,
+        materialized_period_data: Option<&MaterializedPeriodDataFiles>,
     ) -> Result<()> {
         for key_id in plan.key_ids.iter().copied() {
             let ki = self.key_index(key_id)?;
@@ -2656,7 +2541,6 @@ impl SolutionDataset {
             }
 
             let task = DataRangeWriteTask {
-                table_name: plan.table_name.clone(),
                 key_id,
                 sample_id: key.sample_id,
                 band_id: key.band_id,
@@ -2667,210 +2551,10 @@ impl SolutionDataset {
                 value_count: ki.length,
                 period_offset: ki.period_offset,
             };
-            self.write_data_range_task_to_parquet(writer, &task, None)?;
+            self.write_data_range_task_to_parquet(writer, &task, materialized_period_data)?;
         }
 
         Ok(())
-    }
-
-    fn populate_table_data_indexed_ranges(
-        &self,
-        con: &mut duckdb::Connection,
-        plans: Vec<DataTableWritePlan>,
-        worker_count: usize,
-        staging_parent: &std::path::Path,
-        deflate_index_interval_bytes: u64,
-        progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
-    ) -> Result<()> {
-        let tasks = self.build_data_range_write_tasks(&plans)?;
-        if tasks.is_empty() {
-            return Ok(());
-        }
-
-        let mut period_type_ids = std::collections::BTreeSet::new();
-        for task in &tasks {
-            period_type_ids.insert(task.period_type_id);
-        }
-        let compressed_indexes = self.build_compressed_period_data_indexes(
-            staging_parent,
-            deflate_index_interval_bytes,
-            &period_type_ids,
-            progress,
-        )?;
-
-        let worker_count = worker_count.min(tasks.len()).max(1);
-        let total_ranges = tasks.len();
-        let worker_tasks = Self::distribute_data_range_write_tasks(tasks, worker_count);
-        Self::report_duckdb_progress(
-            progress,
-            &format!(
-                "Writing indexed compressed BIN ranges with {} workers",
-                worker_tasks.len()
-            ),
-        );
-
-        let staging_dir = tempfile::Builder::new()
-            .prefix("plexos2duckdb-range-parquet-")
-            .tempdir_in(staging_parent)?;
-        let (tx, rx) = std::sync::mpsc::channel::<DataRangeWriteWorkerEvent>();
-        let staged_files = std::thread::scope(|scope| -> Result<Vec<StagedDataFiles>> {
-            let mut handles = Vec::with_capacity(worker_tasks.len());
-            for (worker_idx, worker_task_list) in worker_tasks.into_iter().enumerate() {
-                let worker_dir = staging_dir
-                    .path()
-                    .join(format!("range_worker_{worker_idx}"));
-                let worker_tx = tx.clone();
-                let compressed_indexes = &compressed_indexes;
-
-                handles.push(scope.spawn(move || -> Result<StagedDataFiles> {
-                    std::fs::create_dir_all(&worker_dir)?;
-                    let table_files = self.write_data_range_tasks_to_parquet_files(
-                        worker_idx,
-                        worker_task_list,
-                        &worker_dir,
-                        compressed_indexes,
-                        &worker_tx,
-                    )?;
-                    Ok(StagedDataFiles::new(table_files))
-                }));
-            }
-            drop(tx);
-
-            let mut completed_ranges = 0usize;
-            while completed_ranges < total_ranges {
-                let event = match rx.recv() {
-                    Ok(event) => event,
-                    Err(_) => {
-                        for (worker_idx, handle) in handles.into_iter().enumerate() {
-                            let result = handle
-                                .join()
-                                .map_err(|_| eyre!("Range worker {} panicked", worker_idx + 1))?;
-                            if let Err(err) = result {
-                                return Err(eyre!("Range worker {} failed: {err}", worker_idx + 1));
-                            }
-                        }
-                        return Err(eyre!(
-                            "Range worker progress channel closed before all ranges completed ({}/{})",
-                            completed_ranges,
-                            total_ranges
-                        ));
-                    },
-                };
-                match event {
-                    DataRangeWriteWorkerEvent::RangeStarted {
-                        worker_id,
-                        index,
-                        total,
-                        table_name,
-                        key_id,
-                        start_value,
-                        values,
-                    } => {
-                        if let Some(report) = progress.as_mut() {
-                            report(DuckdbProgress::Event(ProgressEvent::DataWorkerRangeStart {
-                                worker_id,
-                                index,
-                                total,
-                                table_name,
-                                key_id,
-                                start_value,
-                                values,
-                            }));
-                        }
-                    },
-                    DataRangeWriteWorkerEvent::RangeCompleted {
-                        worker_id,
-                        index,
-                        total,
-                    } => {
-                        if let Some(report) = progress.as_mut() {
-                            report(DuckdbProgress::Event(ProgressEvent::DataWorkerRangeEnd {
-                                worker_id,
-                                index,
-                                total,
-                            }));
-                        }
-                        completed_ranges += 1;
-                    },
-                }
-            }
-
-            let mut staged_files = Vec::with_capacity(handles.len());
-            Self::report_duckdb_progress(progress, "Finalizing indexed range parquet files");
-            for (worker_idx, handle) in handles.into_iter().enumerate() {
-                let result = handle
-                    .join()
-                    .map_err(|_| eyre!("Range worker {} panicked", worker_idx + 1))?;
-                staged_files.push(
-                    result.map_err(|err| eyre!("Range worker {} failed: {err}", worker_idx + 1))?,
-                );
-            }
-            Ok(staged_files)
-        })?;
-
-        Self::report_duckdb_progress(progress, "Merging indexed range parquet files");
-        self.merge_staged_data_files(con, &staged_files, progress)?;
-        Ok(())
-    }
-
-    fn write_data_range_tasks_to_parquet_files(
-        &self,
-        worker_idx: usize,
-        worker_task_list: Vec<DataRangeWriteTask>,
-        worker_dir: &std::path::Path,
-        compressed_indexes: &CompressedDeflateIndexes,
-        worker_tx: &std::sync::mpsc::Sender<DataRangeWriteWorkerEvent>,
-    ) -> Result<std::collections::BTreeMap<String, Vec<std::path::PathBuf>>> {
-        let worker_total = worker_task_list.len();
-        let mut table_files = std::collections::BTreeMap::<String, Vec<std::path::PathBuf>>::new();
-        let mut current_table_name: Option<String> = None;
-        let mut current_writer: Option<ArrowWriter<std::fs::File>> = None;
-        let mut table_file_index = 0usize;
-
-        for (task_idx, task) in worker_task_list.into_iter().enumerate() {
-            if current_table_name.as_deref() != Some(task.table_name.as_str()) {
-                if let Some(writer) = current_writer.take() {
-                    writer.close()?;
-                }
-
-                table_file_index += 1;
-                let parquet_path = worker_dir.join(format!("table_{table_file_index:05}.parquet"));
-                current_writer = Some(Self::open_data_parquet_writer(&parquet_path)?);
-                current_table_name = Some(task.table_name.clone());
-                table_files
-                    .entry(task.table_name.clone())
-                    .or_default()
-                    .push(parquet_path);
-            }
-
-            let worker_task_index = task_idx + 1;
-            let _ = worker_tx.send(DataRangeWriteWorkerEvent::RangeStarted {
-                worker_id: worker_idx,
-                index: worker_task_index,
-                total: worker_total,
-                table_name: task.table_name.clone(),
-                key_id: task.key_id,
-                start_value: task.start_value_index,
-                values: task.value_count,
-            });
-
-            let writer = current_writer
-                .as_mut()
-                .expect("range task writer is opened before writing");
-            self.write_data_range_task_to_parquet(writer, &task, Some(compressed_indexes))?;
-
-            let _ = worker_tx.send(DataRangeWriteWorkerEvent::completed(
-                worker_idx,
-                worker_task_index,
-                worker_total,
-            ));
-        }
-
-        if let Some(writer) = current_writer {
-            writer.close()?;
-        }
-
-        Ok(table_files)
     }
 
     fn open_data_parquet_writer(path: &std::path::Path) -> Result<ArrowWriter<std::fs::File>> {
@@ -2886,154 +2570,13 @@ impl SolutionDataset {
         )?)
     }
 
-    fn build_compressed_period_data_indexes(
-        &self,
-        _staging_parent: &std::path::Path,
-        interval_bytes: u64,
-        period_type_ids: &std::collections::BTreeSet<i64>,
-        progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
-    ) -> Result<CompressedDeflateIndexes> {
-        let interval_bytes = interval_bytes.max(MIN_DEFLATE_INDEX_INTERVAL_BYTES);
-        let compressed_entries: Vec<_> = self
-            .period_data
-            .iter()
-            .filter(|(period_type_id, _period_data)| period_type_ids.contains(period_type_id))
-            .filter_map(|(period_type_id, period_data)| {
-                period_data
-                    .compressed_zip_entry()
-                    .map(|entry| (*period_type_id, entry))
-            })
-            .collect();
-
-        let total_entries = compressed_entries.len();
-        let mut indexes = DeflateIndexMap::with_capacity(compressed_entries.len());
-        for (idx, (period_type_id, entry)) in compressed_entries.into_iter().enumerate() {
-            Self::report_duckdb_progress(
-                progress,
-                &format!(
-                    "Indexing {} ({}/{}, interval {} MiB)",
-                    entry.name,
-                    idx + 1,
-                    total_entries,
-                    interval_bytes / MIB_BYTES
-                ),
-            );
-            let index = entry
-                .build_deflate_index(interval_bytes)
-                .map_err(|err| eyre!("Failed indexing compressed BIN '{}': {}", entry.name, err))?;
-            let checkpoint_count = index.index.checkpoint_count();
-            let window_bytes = index.index.window_bytes();
-            Self::report_duckdb_progress(
-                progress,
-                &format!(
-                    "Indexed {} into {} deflate checkpoints ({:.1} MiB)",
-                    entry.name,
-                    checkpoint_count,
-                    window_bytes as f64 / MIB_BYTES as f64
-                ),
-            );
-            indexes.insert(period_type_id, Arc::new(index));
-        }
-
-        Ok(CompressedDeflateIndexes {
-            by_period_type_id: indexes,
-        })
-    }
-
-    fn build_data_range_write_tasks(
-        &self,
-        plans: &[DataTableWritePlan],
-    ) -> Result<Vec<DataRangeWriteTask>> {
-        let mut tasks = Vec::new();
-        for plan in plans {
-            for key_id in plan.key_ids.iter().copied() {
-                let ki = self.key_index(key_id)?;
-                let key = self.key(key_id)?;
-                if ki.position % 8 != 0 {
-                    return Err(eyre!(
-                        "BIN position misaligned for key_id {} (pos_bytes={})",
-                        key_id,
-                        ki.position
-                    ));
-                }
-
-                let mut start_value_index = 0u64;
-                while start_value_index < ki.length {
-                    let value_count = (ki.length - start_value_index).min(DATA_RANGE_TASK_VALUES);
-                    let byte_delta = start_value_index
-                        .checked_mul(8)
-                        .ok_or_else(|| eyre!("Byte offset overflow for key_id {}", key_id))?;
-                    let position = ki
-                        .position
-                        .checked_add(byte_delta)
-                        .ok_or_else(|| eyre!("Byte offset overflow for key_id {}", key_id))?;
-                    tasks.push(DataRangeWriteTask {
-                        table_name: plan.table_name.clone(),
-                        key_id,
-                        sample_id: key.sample_id,
-                        band_id: key.band_id,
-                        membership_id: key.membership_id,
-                        period_type_id: ki.period_type_id,
-                        position,
-                        start_value_index,
-                        value_count,
-                        period_offset: ki.period_offset,
-                    });
-                    start_value_index = start_value_index
-                        .checked_add(value_count)
-                        .ok_or_else(|| eyre!("Value index overflow for key_id {}", key_id))?;
-                }
-            }
-        }
-
-        tasks.sort_by(|a, b| {
-            b.estimated_values()
-                .cmp(&a.estimated_values())
-                .then_with(|| a.table_name.cmp(&b.table_name))
-                .then_with(|| a.key_id.cmp(&b.key_id))
-                .then_with(|| a.start_value_index.cmp(&b.start_value_index))
-        });
-        Ok(tasks)
-    }
-
-    fn distribute_data_range_write_tasks(
-        tasks: Vec<DataRangeWriteTask>,
-        worker_count: usize,
-    ) -> Vec<Vec<DataRangeWriteTask>> {
-        let mut worker_tasks = vec![Vec::<DataRangeWriteTask>::new(); worker_count];
-        let mut worker_loads = vec![0u128; worker_count];
-
-        for task in tasks {
-            let (worker_idx, _) = worker_loads
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, load)| **load)
-                .expect("worker_count must be non-zero");
-
-            worker_loads[worker_idx] =
-                worker_loads[worker_idx].saturating_add(task.estimated_values());
-            worker_tasks[worker_idx].push(task);
-        }
-
-        for tasks in &mut worker_tasks {
-            tasks.sort_by(|a, b| {
-                a.table_name
-                    .cmp(&b.table_name)
-                    .then_with(|| a.key_id.cmp(&b.key_id))
-                    .then_with(|| a.start_value_index.cmp(&b.start_value_index))
-            });
-        }
-        worker_tasks.retain(|tasks| !tasks.is_empty());
-        worker_tasks
-    }
-
     fn write_data_range_task_to_parquet(
         &self,
         writer: &mut ArrowWriter<std::fs::File>,
         task: &DataRangeWriteTask,
-        compressed_indexes: Option<&CompressedDeflateIndexes>,
+        materialized_period_data: Option<&MaterializedPeriodDataFiles>,
     ) -> Result<()> {
-        self.write_data_range_task_batches(task, compressed_indexes, |record_batch| {
+        self.write_data_range_task_batches(task, materialized_period_data, |record_batch| {
             writer.write(&record_batch)?;
             Ok(())
         })
@@ -3042,9 +2585,14 @@ impl SolutionDataset {
     fn write_data_range_task_batches(
         &self,
         task: &DataRangeWriteTask,
-        compressed_indexes: Option<&CompressedDeflateIndexes>,
+        materialized_period_data: Option<&MaterializedPeriodDataFiles>,
         mut write_batch: impl FnMut(RecordBatch) -> Result<()>,
     ) -> Result<()> {
+        if let Some(file) = materialized_period_data.and_then(|data| data.get(task.period_type_id))
+        {
+            return Self::write_data_range_task_batches_from_file(file, task, &mut write_batch);
+        }
+
         let period_data = self
             .period_data
             .get(&task.period_type_id)
@@ -3053,91 +2601,81 @@ impl SolutionDataset {
         let mut chunk_buf = vec![0u8; (DATA_APPEND_BATCH_VALUES as usize) * 8];
         let mut value_offset = 0u64;
 
-        match period_data {
-            PeriodData::CompressedZipEntry(entry) => {
-                let compressed_indexes = compressed_indexes.ok_or_else(|| {
+        while value_offset < task.value_count {
+            let chunk_values = (task.value_count - value_offset).min(DATA_APPEND_BATCH_VALUES);
+            let chunk_bytes = Self::data_chunk_byte_len(task.key_id, chunk_values)?;
+            let offset_delta = value_offset
+                .checked_mul(8)
+                .ok_or_else(|| eyre!("Byte offset overflow for key_id {}", task.key_id))?;
+            let chunk_offset = task
+                .position
+                .checked_add(offset_delta)
+                .ok_or_else(|| eyre!("Byte offset overflow for key_id {}", task.key_id))?;
+
+            period_data
+                .read_exact_at(chunk_offset, &mut chunk_buf[..chunk_bytes])
+                .map_err(|err| {
                     eyre!(
-                        "missing deflate seek indexes for compressed period type {}",
-                        task.period_type_id
-                    )
-                })?;
-                let index = compressed_indexes.get(task.period_type_id).ok_or_else(|| {
-                    eyre!(
-                        "missing deflate seek index for period type {}",
-                        task.period_type_id
-                    )
-                })?;
-                let mut decoder = entry.indexed_reader(index, task.position).map_err(|err| {
-                    eyre!(
-                        "Failed opening indexed compressed period data for key_id {} at byte offset {}: {}",
+                        "Failed reading period data for key_id {} at byte offset {}: {}",
                         task.key_id,
-                        task.position,
+                        chunk_offset,
                         err
                     )
                 })?;
 
-                while value_offset < task.value_count {
-                    let chunk_values =
-                        (task.value_count - value_offset).min(DATA_APPEND_BATCH_VALUES);
-                    let chunk_bytes = Self::data_chunk_byte_len(task.key_id, chunk_values)?;
+            Self::write_data_range_batch(
+                task,
+                value_offset,
+                &chunk_buf[..chunk_bytes],
+                &mut write_batch,
+            )?;
+            value_offset = value_offset
+                .checked_add(chunk_values)
+                .ok_or_else(|| eyre!("Value index overflow for key_id {}", task.key_id))?;
+        }
 
-                    decoder
-                        .read_exact(&mut chunk_buf[..chunk_bytes])
-                        .map_err(|err| {
-                            eyre!(
-                                "Failed reading indexed compressed period data for key_id {} at byte offset {}: {}",
-                                task.key_id,
-                                task.position + value_offset.saturating_mul(8),
-                                err
-                            )
-                        })?;
+        Ok(())
+    }
 
-                    Self::write_data_range_batch(
-                        task,
-                        value_offset,
-                        &chunk_buf[..chunk_bytes],
-                        &mut write_batch,
-                    )?;
-                    value_offset = value_offset
-                        .checked_add(chunk_values)
-                        .ok_or_else(|| eyre!("Value index overflow for key_id {}", task.key_id))?;
-                }
-            },
-            _ => {
-                while value_offset < task.value_count {
-                    let chunk_values =
-                        (task.value_count - value_offset).min(DATA_APPEND_BATCH_VALUES);
-                    let chunk_bytes = Self::data_chunk_byte_len(task.key_id, chunk_values)?;
-                    let offset_delta = value_offset
-                        .checked_mul(8)
-                        .ok_or_else(|| eyre!("Byte offset overflow for key_id {}", task.key_id))?;
-                    let chunk_offset = task
-                        .position
-                        .checked_add(offset_delta)
-                        .ok_or_else(|| eyre!("Byte offset overflow for key_id {}", task.key_id))?;
+    fn write_data_range_task_batches_from_file(
+        file: &std::fs::File,
+        task: &DataRangeWriteTask,
+        write_batch: &mut impl FnMut(RecordBatch) -> Result<()>,
+    ) -> Result<()> {
+        let mut chunk_buf = vec![0u8; (DATA_APPEND_BATCH_VALUES as usize) * 8];
+        let mut value_offset = 0u64;
 
-                    period_data
-                        .read_exact_at(chunk_offset, &mut chunk_buf[..chunk_bytes])
-                        .map_err(|err| {
-                            eyre!(
-                                "Failed reading period data for key_id {} at byte offset {}: {}",
-                                task.key_id,
-                                chunk_offset,
-                                err
-                            )
-                        })?;
+        while value_offset < task.value_count {
+            let chunk_values = (task.value_count - value_offset).min(DATA_APPEND_BATCH_VALUES);
+            let chunk_bytes = Self::data_chunk_byte_len(task.key_id, chunk_values)?;
+            let offset_delta = value_offset
+                .checked_mul(8)
+                .ok_or_else(|| eyre!("Byte offset overflow for key_id {}", task.key_id))?;
+            let chunk_offset = task
+                .position
+                .checked_add(offset_delta)
+                .ok_or_else(|| eyre!("Byte offset overflow for key_id {}", task.key_id))?;
 
-                    Self::write_data_range_batch(
-                        task,
-                        value_offset,
-                        &chunk_buf[..chunk_bytes],
-                        &mut write_batch,
-                    )?;
-                    value_offset = value_offset
-                        .checked_add(chunk_values)
-                        .ok_or_else(|| eyre!("Value index overflow for key_id {}", task.key_id))?;
-                }
-            },
+            Self::read_exact_at(file, chunk_offset, &mut chunk_buf[..chunk_bytes]).map_err(
+                |err| {
+                    eyre!(
+                        "Failed reading materialized period data for key_id {} at byte offset {}: {}",
+                        task.key_id,
+                        chunk_offset,
+                        err
+                    )
+                },
+            )?;
+
+            Self::write_data_range_batch(
+                task,
+                value_offset,
+                &chunk_buf[..chunk_bytes],
+                write_batch,
+            )?;
+            value_offset = value_offset
+                .checked_add(chunk_values)
+                .ok_or_else(|| eyre!("Value index overflow for key_id {}", task.key_id))?;
         }
 
         Ok(())
@@ -4643,7 +4181,7 @@ mod tests {
     }
 
     #[test]
-    fn read_zip_archive_indexes_deflated_bin_entries_without_buffering() -> Result<()> {
+    fn read_zip_archive_records_deflated_bin_entries_without_materializing() -> Result<()> {
         let temp_dir = tempfile::TempDir::new()?;
         let zip_path = temp_dir.path().join("Model_Base_Solution.zip");
 
@@ -4668,24 +4206,89 @@ mod tests {
             .get(&0)
             .ok_or_else(|| eyre!("expected period data for digit 0"))?;
 
-        let entry = match data {
-            PeriodData::CompressedZipEntry(entry) => entry,
-            _ => return Err(eyre!("expected compressed ZIP period data metadata")),
-        };
-        let index = entry.build_deflate_index(8)?;
-        let mut actual = [0u8; 16];
-        entry.read_exact_at_with_index(&index, 0, &mut actual)?;
+        match data {
+            PeriodData::CompressedZipEntry(_) => {},
+            _ => return Err(eyre!("expected deflated ZIP period data metadata")),
+        }
 
-        let first = f64::from_le_bytes(actual[0..8].try_into().expect("slice length matches"));
-        let second = f64::from_le_bytes(actual[8..16].try_into().expect("slice length matches"));
-
-        assert_eq!(first, 1.25);
-        assert_eq!(second, 2.5);
         Ok(())
     }
 
     #[test]
-    fn deflate_index_reads_random_offsets_from_zip_member() -> Result<()> {
+    fn materializes_only_compressed_period_data_used_by_plans() -> Result<()> {
+        let temp_dir = tempfile::TempDir::new()?;
+        let zip_path = temp_dir.path().join("Model_Base_Solution.zip");
+
+        let zip_file = std::fs::File::create(&zip_path)?;
+        let mut zip_writer = zip::ZipWriter::new(zip_file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+
+        zip_writer.start_file("Model Base Solution.xml", options)?;
+        zip_writer.write_all(b"<root />")?;
+
+        zip_writer.start_file("t_data_0.BIN", options)?;
+        for value in [1.25_f64, 2.5_f64] {
+            zip_writer.write_all(&value.to_le_bytes())?;
+        }
+
+        zip_writer.start_file("t_data_1.BIN", options)?;
+        let expected = [10.0_f64, 20.0_f64];
+        for value in expected {
+            zip_writer.write_all(&value.to_le_bytes())?;
+        }
+        zip_writer.finish()?;
+
+        let (_xml_content, period_data) =
+            SolutionDataset::read_zip_archive(&zip_path, "", &mut None)?;
+        let mut key_index = indexmap::IndexMap::new();
+        key_index.insert(
+            10,
+            KeyIndex {
+                key_id: 10,
+                period_type_id: 1,
+                length: 2,
+                position: 0,
+                period_offset: 0,
+            },
+        );
+        let dataset = SolutionDataset {
+            key_index,
+            period_data,
+            ..Default::default()
+        };
+        let plans = vec![DataTableWritePlan {
+            table_name: "selected_table".to_string(),
+            key_ids: vec![10],
+            estimated_values: 2,
+        }];
+        let mut progress: Option<&mut dyn FnMut(DuckdbProgress)> = None;
+
+        let materialized = dataset
+            .materialize_compressed_period_data_for_plans(&plans, temp_dir.path(), &mut progress)?
+            .ok_or_else(|| eyre!("expected selected compressed period data to be materialized"))?;
+
+        assert!(
+            materialized.get(0).is_none(),
+            "unselected compressed period data should not be materialized"
+        );
+        let file = materialized
+            .get(1)
+            .ok_or_else(|| eyre!("selected compressed period data was not materialized"))?;
+
+        let mut actual = [0u8; 16];
+        SolutionDataset::read_exact_at(file, 0, &mut actual)?;
+
+        let first = f64::from_le_bytes(actual[0..8].try_into().expect("slice length matches"));
+        let second = f64::from_le_bytes(actual[8..16].try_into().expect("slice length matches"));
+
+        assert_eq!(first, 10.0);
+        assert_eq!(second, 20.0);
+        Ok(())
+    }
+
+    #[test]
+    fn read_zip_archive_uses_zip_offsets_for_stored_bin_entries() -> Result<()> {
         let temp_dir = tempfile::TempDir::new()?;
         let zip_path = temp_dir.path().join("Model_Base_Solution.zip");
         let value_count = 300_000usize;
@@ -4694,7 +4297,7 @@ mod tests {
         let zip_file = std::fs::File::create(&zip_path)?;
         let mut zip_writer = zip::ZipWriter::new(zip_file);
         let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
+            .compression_method(zip::CompressionMethod::Stored);
 
         zip_writer.start_file("Model Base Solution.xml", options)?;
         zip_writer.write_all(b"<root />")?;
@@ -4717,19 +4320,14 @@ mod tests {
         let data = period_data
             .get(&0)
             .ok_or_else(|| eyre!("expected period data for digit 0"))?;
-        let entry = match data {
-            PeriodData::CompressedZipEntry(entry) => entry,
-            _ => return Err(eyre!("expected compressed ZIP period data metadata")),
-        };
-        let index = entry.build_deflate_index(MIB_BYTES)?;
-        assert!(
-            index.index.checkpoint_count() > 0,
-            "expected at least one deflate checkpoint"
-        );
+        match data {
+            PeriodData::ZipEntry(_) => {},
+            _ => return Err(eyre!("expected stored ZIP period data metadata")),
+        }
 
         for offset in [0usize, 8 * 123, 8 * 4097 + 3, expected.len() - 19] {
             let mut actual = vec![0u8; 19];
-            entry.read_exact_at_with_index(&index, offset as u64, &mut actual)?;
+            data.read_exact_at(offset as u64, &mut actual)?;
             assert_eq!(actual, expected[offset..offset + 19]);
         }
 
