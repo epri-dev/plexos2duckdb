@@ -57,6 +57,9 @@ pub struct ConvertArgs {
     /// Number of threads to use when writing time series data tables
     #[arg(long)]
     pub n_threads: Option<std::num::NonZeroUsize>,
+    /// Regex matched against generated data table names; defaults to all tables
+    #[arg(long)]
+    pub table_name_pattern: Option<String>,
     /// Deflate seek-index spacing for compressed ZIP BIN files, in MiB
     #[arg(long, default_value_t = plexos2duckdb::DEFAULT_DEFLATE_INDEX_INTERVAL_MIB)]
     pub deflate_index_interval_mib: u64,
@@ -394,6 +397,14 @@ fn convert(args: ConvertArgs) -> Result<()> {
         .parent()
         .ok_or_else(|| eyre!("Input path has no parent directory"))?;
     let output_path = resolve_output_path(&input_path, args.output, args.force)?;
+    let table_name_pattern =
+        if let Some(pattern) = args.table_name_pattern.as_deref() {
+            Some(regex::Regex::new(pattern).map_err(|err| {
+                eyre!("Invalid --table-name-pattern regex {:?}: {}", pattern, err)
+            })?)
+        } else {
+            None
+        };
 
     let mut mp = None;
     let mut pb = None;
@@ -828,6 +839,9 @@ fn convert(args: ConvertArgs) -> Result<()> {
     let mut builder = dataset.to_duckdb(&output_path);
     if let Some(threads) = args.n_threads {
         builder = builder.with_data_write_threads(threads.get());
+    }
+    if let Some(pattern) = table_name_pattern {
+        builder = builder.with_data_table_name_pattern(pattern);
     }
     if args.deflate_index_interval_mib == 0 {
         return Err(eyre!(
