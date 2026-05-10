@@ -179,6 +179,10 @@ fn generated_output_path(temp_dir: &tempfile::TempDir, fixture_name: &str) -> Pa
 }
 
 fn run_convert(source_path: &Path, output_path: &Path) {
+    run_convert_with_args(source_path, output_path, &[]);
+}
+
+fn run_convert_with_args(source_path: &Path, output_path: &Path, extra_args: &[&str]) {
     let output = Command::new(env!("CARGO_BIN_EXE_plexos2duckdb"))
         .args([
             "convert",
@@ -188,6 +192,7 @@ fn run_convert(source_path: &Path, output_path: &Path) {
             output_path.to_str().expect("output path utf8"),
             "--no-progress-bar",
         ])
+        .args(extra_args)
         .output()
         .expect("run plexos2duckdb convert");
 
@@ -420,6 +425,46 @@ fn day_ahead_database_matches_detailed_schema_expectations() {
         rows.next().expect("read report row").is_some(),
         "expected report view to return at least one row"
     );
+}
+
+#[test]
+fn convert_filters_generated_data_tables_by_pattern() {
+    let fixture_name = "Model_Base_LT_Solution.zip";
+    let fixture_dir = fixture_dir();
+    let temp_dir = temp_dir();
+    let source_path = fixture_dir.join(fixture_name);
+    let output_path = generated_output_path(&temp_dir, fixture_name);
+
+    run_convert_with_args(
+        &source_path,
+        &output_path,
+        &[
+            "--table-name-pattern",
+            "^LT__Interval__Batteries__Generation$",
+        ],
+    );
+    let con = open_connection(&output_path);
+
+    let expected_tables = vec!["LT__Interval__Batteries__Generation".to_string()];
+    assert_eq!(
+        fetch_table_names(&con, "data", "BASE TABLE"),
+        expected_tables,
+        "unexpected filtered data table set",
+    );
+    assert_eq!(
+        fetch_table_names(&con, "report", "VIEW"),
+        expected_tables,
+        "unexpected filtered report view set",
+    );
+
+    let count: i64 = con
+        .query_row(
+            "SELECT COUNT(*) FROM data.\"LT__Interval__Batteries__Generation\"",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count filtered data table rows");
+    assert_eq!(count, 144, "unexpected filtered data row count");
 }
 
 #[test]
