@@ -1898,15 +1898,24 @@ impl SolutionDataset {
         external_data_parquet_dir: Option<&std::path::Path>,
     ) -> Result<()> {
         let db_path = db_path.as_ref();
-        let total_steps = 28;
+        let progress_steps = Self::duckdb_progress_step_plan();
+        let total_steps = progress_steps.len();
+        let mut progress_steps_iter = progress_steps.iter();
+        let mut next_progress_step = || {
+            *progress_steps_iter
+                .next()
+                .expect("duckdb progress plan and execution are out of sync")
+        };
         let mut step_index = 0;
         let mut direct_stage_dir = None;
-        Self::report_duckdb_progress(&mut progress, "Initializing DuckDB");
+
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         let mut con = Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Initializing DuckDB",
+            label,
             |_progress| {
                 let (con, stage_dir) = Self::open_duckdb_write_connection(db_path)?;
                 direct_stage_dir = Some(stage_dir);
@@ -1914,206 +1923,249 @@ impl SolutionDataset {
             },
         )?;
 
-        Self::report_duckdb_progress(&mut progress, "Configuring DuckDB session");
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Configuring DuckDB session",
+            label,
             |_progress| {
                 con.execute_batch("SET preserve_insertion_order = false;")?;
                 Ok(())
             },
         )?;
 
-        Self::report_duckdb_progress(&mut progress, "Creating raw schema");
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Creating raw schema",
+            label,
             |_progress| {
                 con.execute_batch("CREATE SCHEMA IF NOT EXISTS raw;")?;
                 Ok(())
             },
         )?;
 
-        Self::report_duckdb_progress(&mut progress, "Writing metadata");
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Writing metadata",
+            label,
             |progress| self.populate_table_metadata(&mut con, progress),
         )?;
 
-        Self::report_duckdb_progress(&mut progress, "Writing config");
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Writing config",
+            label,
             |progress| self.populate_table_config(&mut con, progress),
         )?;
-        Self::report_duckdb_progress(&mut progress, "Writing memberships");
+
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Writing memberships",
+            label,
             |progress| self.populate_table_memberships(&mut con, progress),
         )?;
-        Self::report_duckdb_progress(&mut progress, "Writing collections");
+
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Writing collections",
+            label,
             |progress| self.populate_table_collections(&mut con, progress),
         )?;
-        Self::report_duckdb_progress(&mut progress, "Writing classes");
+
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Writing classes",
+            label,
             |progress| self.populate_table_classes(&mut con, progress),
         )?;
-        Self::report_duckdb_progress(&mut progress, "Writing class groups");
+
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Writing class groups",
+            label,
             |progress| self.populate_table_class_groups(&mut con, progress),
         )?;
-        Self::report_duckdb_progress(&mut progress, "Writing categories");
+
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Writing categories",
+            label,
             |progress| self.populate_table_categories(&mut con, progress),
         )?;
-        Self::report_duckdb_progress(&mut progress, "Writing bands");
+
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Writing bands",
+            label,
             |progress| self.populate_table_bands(&mut con, progress),
         )?;
-        Self::report_duckdb_progress(&mut progress, "Writing models");
+
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Writing models",
+            label,
             |progress| self.populate_table_models(&mut con, progress),
         )?;
-        Self::report_duckdb_progress(&mut progress, "Writing objects");
+
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Writing objects",
+            label,
             |progress| self.populate_table_objects(&mut con, progress),
         )?;
-        Self::report_duckdb_progress(&mut progress, "Writing keys");
+
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Writing keys",
+            label,
             |progress| self.populate_table_keys(&mut con, progress),
         )?;
-        Self::report_duckdb_progress(&mut progress, "Writing key indexes");
+
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Writing key indexes",
+            label,
             |progress| self.populate_table_key_indexes(&mut con, progress),
         )?;
-        Self::report_duckdb_progress(&mut progress, "Writing properties");
+
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Writing properties",
+            label,
             |progress| self.populate_table_properties(&mut con, progress),
         )?;
-        Self::report_duckdb_progress(&mut progress, "Writing timeslices");
+
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Writing timeslices",
+            label,
             |progress| self.populate_table_timeslices(&mut con, progress),
         )?;
-        Self::report_duckdb_progress(&mut progress, "Writing samples");
+
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Writing samples",
+            label,
             |progress| self.populate_table_samples(&mut con, progress),
         )?;
-        Self::report_duckdb_progress(&mut progress, "Writing units");
+
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Writing units",
+            label,
             |progress| self.populate_table_units(&mut con, progress),
         )?;
-        Self::report_duckdb_progress(&mut progress, "Writing memo objects");
+
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Writing memo objects",
+            label,
             |progress| self.populate_table_memo_objects(&mut con, progress),
         )?;
-        Self::report_duckdb_progress(&mut progress, "Writing custom columns");
+
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Writing custom columns",
+            label,
             |progress| self.populate_table_custom_columns(&mut con, progress),
         )?;
-        Self::report_duckdb_progress(&mut progress, "Writing attribute data");
+
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Writing attribute data",
+            label,
             |progress| self.populate_table_attribute_data(&mut con, progress),
         )?;
-        Self::report_duckdb_progress(&mut progress, "Writing attributes");
+
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Writing attributes",
+            label,
             |progress| self.populate_table_attributes(&mut con, progress),
         )?;
-        Self::report_duckdb_progress(&mut progress, "Writing timestamp blocks");
+
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Writing timestamp blocks",
+            label,
             |progress| self.populate_table_timestamps_block(&mut con, progress),
         )?;
 
-        Self::report_duckdb_progress(&mut progress, "Writing time series data");
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Writing time series data",
+            label,
             |progress| {
                 self.populate_table_data(
                     &mut con,
@@ -2126,42 +2178,78 @@ impl SolutionDataset {
             },
         )?;
 
-        Self::report_duckdb_progress(&mut progress, "Creating processed views");
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Creating processed views",
+            label,
             |_progress| {
                 self.create_processed_views(&mut con)?;
                 Ok(())
             },
         )?;
 
-        Self::report_duckdb_progress(&mut progress, "Creating report views");
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Creating report views",
+            label,
             |_progress| {
                 self.create_report_views(&mut con, data_table_name_pattern)?;
                 Ok(())
             },
         )?;
 
-        Self::report_duckdb_progress(&mut progress, "Persisting DuckDB database");
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
-            "Persisting DuckDB database",
+            label,
             |_progress| Self::persist_duckdb_database(&mut con, db_path),
         )?;
 
         drop(con);
         drop(direct_stage_dir);
         Ok(())
+    }
+
+    fn duckdb_progress_step_plan() -> &'static [&'static str] {
+        &[
+            "Initializing DuckDB",
+            "Configuring DuckDB session",
+            "Creating raw schema",
+            "Writing metadata",
+            "Writing config",
+            "Writing memberships",
+            "Writing collections",
+            "Writing classes",
+            "Writing class groups",
+            "Writing categories",
+            "Writing bands",
+            "Writing models",
+            "Writing objects",
+            "Writing keys",
+            "Writing key indexes",
+            "Writing properties",
+            "Writing timeslices",
+            "Writing samples",
+            "Writing units",
+            "Writing memo objects",
+            "Writing custom columns",
+            "Writing attribute data",
+            "Writing attributes",
+            "Writing timestamp blocks",
+            "Writing time series data",
+            "Creating processed views",
+            "Creating report views",
+            "Persisting DuckDB database",
+        ]
     }
 
     fn populate_table_data(
@@ -2972,7 +3060,8 @@ impl SolutionDataset {
             .prefix("plexos2duckdb-stage-")
             .tempdir_in(staging_parent)?;
         let staging_path = staging_dir.path().join("stage.duckdb");
-        Ok((duckdb::Connection::open(staging_path)?, staging_dir))
+        let con = duckdb::Connection::open(staging_path)?;
+        Ok((con, staging_dir))
     }
 
     fn duckdb_staging_parent(db_path: &std::path::Path) -> std::path::PathBuf {
