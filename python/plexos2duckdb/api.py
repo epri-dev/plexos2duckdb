@@ -108,7 +108,7 @@ class PLEXOS2DuckDB:
         database: str | pathlib.Path | None = None,
         *,
         format: str = "table",
-    ) -> Table | dict[str, Any]:
+    ) -> dict[str, Table] | dict[str, Any]:
         database_path = self._resolve_output_path(database)
         completed = self._run_command(
             [
@@ -124,7 +124,10 @@ class PLEXOS2DuckDB:
             return payload
         if format != "table":
             raise PLEXOS2DuckDBError("inspect format must be either 'table' or 'json'")
-        return self._build_metadata_table(payload["metadata"])
+        return {
+            "metadata": self._build_metadata_table(payload["metadata"]),
+            "inventory": self._build_inventory_table(payload["inventory"]),
+        }
 
     def open(
         self,
@@ -193,7 +196,6 @@ class PLEXOS2DuckDB:
         output_path: str | pathlib.Path | None = None,
         *,
         force: bool = False,
-        in_memory: bool = False,
         n_threads: int | None = None,
         table_name_pattern: str | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
@@ -214,8 +216,6 @@ class PLEXOS2DuckDB:
             args.extend(["--output", str(requested_output_path)])
         if force:
             args.append("--force")
-        if in_memory:
-            args.append("--in-memory")
         if n_threads is not None:
             args.extend(["--n-threads", str(n_threads)])
         if table_name_pattern is not None:
@@ -397,10 +397,9 @@ class PLEXOS2DuckDB:
             return path if path.suffix else path.with_suffix(".duckdb")
         if input_path is None:
             return None
-        if input_path.suffix.lower() in {".zip", ".xml"}:
-            candidate = input_path.with_suffix(".duckdb")
-            return candidate if candidate.exists() else None
-        return None
+        if input_path.suffix:
+            return input_path.with_suffix(".duckdb")
+        return input_path.with_suffix(".duckdb")
 
     def _resolve_input_path(
         self, input_path: str | pathlib.Path | None
