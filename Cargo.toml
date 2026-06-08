@@ -1,6 +1,6 @@
 [package]
 name = "plexos2duckdb"
-version = "0.1.0-beta.10"
+version = "0.1.0-beta.11"
 edition = "2024"
 build = "build.rs"
 description = "A tool to convert PLEXOS Solution files to a DuckDB database."
