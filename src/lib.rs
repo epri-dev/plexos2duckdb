@@ -2206,16 +2206,17 @@ impl SolutionDataset {
 
         let label = next_progress_step();
         Self::report_duckdb_progress(&mut progress, label);
+        let stage_dir = direct_stage_dir
+            .take()
+            .expect("staging tempdir must be initialized before persist step");
         Self::with_duckdb_step(
             &mut progress,
             &mut step_index,
             total_steps,
             label,
-            |_progress| Self::persist_duckdb_database(&mut con, db_path),
+            |_progress| Self::persist_duckdb_database(con, stage_dir, db_path),
         )?;
 
-        drop(con);
-        drop(direct_stage_dir);
         Ok(())
     }
 
@@ -3052,6 +3053,12 @@ impl SolutionDataset {
         }
     }
 
+    /// Name of the DuckDB file inside a staging tempdir. The staging tempdir
+    /// is created in the same directory as the final destination so that
+    /// `std::fs::rename` from `staging_db_path` to the destination is an
+    /// atomic move on the same filesystem.
+    const STAGING_DB_FILENAME: &'static str = "stage.duckdb";
+
     fn open_duckdb_write_connection(
         db_path: &std::path::Path,
     ) -> Result<(duckdb::Connection, tempfile::TempDir)> {
@@ -3059,9 +3066,13 @@ impl SolutionDataset {
         let staging_dir = tempfile::Builder::new()
             .prefix("plexos2duckdb-stage-")
             .tempdir_in(staging_parent)?;
-        let staging_path = staging_dir.path().join("stage.duckdb");
+        let staging_path = Self::staging_db_path(&staging_dir);
         let con = duckdb::Connection::open(staging_path)?;
         Ok((con, staging_dir))
+    }
+
+    fn staging_db_path(staging_dir: &tempfile::TempDir) -> std::path::PathBuf {
+        staging_dir.path().join(Self::STAGING_DB_FILENAME)
     }
 
     fn duckdb_staging_parent(db_path: &std::path::Path) -> std::path::PathBuf {
@@ -3072,25 +3083,41 @@ impl SolutionDataset {
             .to_path_buf()
     }
 
+    /// Finalize the staging DuckDB and move it into place at `db_path`.
+    ///
+    /// The staging file lives in a tempdir inside `db_path.parent()`, so it
+    /// is on the same filesystem as the destination and `rename(2)` is
+    /// atomic. This avoids the full read+write pass that
+    /// `ATTACH ... COPY FROM DATABASE ... CHECKPOINT` would perform.
+    ///
+    /// Safety notes for future editors:
+    /// * All views in the staging DB must use unqualified catalog names
+    ///   (e.g. `raw.foo`, not `stage.raw.foo`). DuckDB derives the catalog
+    ///   name from the filename at open time, so a qualified reference
+    ///   would break once the file is renamed to `db_path`'s stem.
+    /// * `con` is dropped before the rename so the file handle is closed
+    ///   and any WAL sidecar is finalized/removed by the checkpoint.
     fn persist_duckdb_database(
-        con: &mut duckdb::Connection,
+        con: duckdb::Connection,
+        staging_dir: tempfile::TempDir,
         db_path: &std::path::Path,
     ) -> Result<()> {
-        let target_catalog_ident = Self::quote_ident("persisted_database");
-        let target_db_path = Self::sql_string_literal(db_path.to_string_lossy().as_ref());
-        let source_catalog_ident = Self::quote_ident(&Self::current_catalog_name(con)?);
-
         con.execute_batch("PRAGMA force_checkpoint;")?;
         con.execute_batch("CHECKPOINT;")?;
+        drop(con);
 
-        con.execute_batch(&format!(
-            "
-              ATTACH '{target_db_path}' AS {target_catalog_ident};
-              COPY FROM DATABASE {source_catalog_ident} TO {target_catalog_ident};
-              CHECKPOINT {target_catalog_ident};
-              DETACH {target_catalog_ident};
-            "
-        ))?;
+        let staging_path = Self::staging_db_path(&staging_dir);
+        std::fs::rename(&staging_path, db_path).map_err(|err| {
+            eyre!(
+                "failed to move staging DuckDB {} to {}: {}",
+                staging_path.display(),
+                db_path.display(),
+                err,
+            )
+        })?;
+        // Explicit drop so the tempdir (now empty of the staging file) is
+        // cleaned up here rather than at the end of the enclosing scope.
+        drop(staging_dir);
         Ok(())
     }
 
