@@ -4275,7 +4275,7 @@ mod tests {
     fn build_small_database() -> Result<(tempfile::TempDir, std::path::PathBuf)> {
         let output_dir = tempfile::TempDir::new()?;
         let db_path = output_dir.path().join("result.duckdb");
-        let (mut con, stage_dir) = SolutionDataset::open_duckdb_write_connection(&db_path)?;
+        let (con, stage_dir) = SolutionDataset::open_duckdb_write_connection(&db_path)?;
 
         con.execute_batch(
             "
@@ -4283,10 +4283,8 @@ mod tests {
               INSERT INTO numbers VALUES (1), (2), (3);
             ",
         )?;
-        SolutionDataset::persist_duckdb_database(&mut con, &db_path)?;
+        SolutionDataset::persist_duckdb_database(con, stage_dir, &db_path)?;
 
-        drop(con);
-        drop(stage_dir);
         Ok((output_dir, db_path))
     }
 
@@ -4298,9 +4296,34 @@ mod tests {
             db_path.display()
         );
         assert!(
+            db_path.is_file(),
+            "expected persisted database to be a regular file at {}",
+            db_path.display()
+        );
+        assert!(
             !wal_path.exists(),
             "expected checkpointed database without WAL sidecar at {}",
             wal_path.display()
+        );
+
+        // The staging tempdir lives beside the destination and must be gone
+        // once `persist_duckdb_database` returns (renamed into place and
+        // tempdir dropped).
+        let parent = db_path.parent().expect("db_path has a parent");
+        let leftover_stage_dirs: Vec<std::path::PathBuf> = std::fs::read_dir(parent)?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("plexos2duckdb-stage-"))
+            })
+            .collect();
+        assert!(
+            leftover_stage_dirs.is_empty(),
+            "expected no staging tempdirs beside {}, found {:?}",
+            db_path.display(),
+            leftover_stage_dirs,
         );
 
         let con = duckdb::Connection::open(db_path)?;
@@ -4462,7 +4485,7 @@ mod tests {
     }
 
     #[test]
-    fn persist_database_uses_stage_copy_and_checkpoint() -> Result<()> {
+    fn persist_database_renames_staging_file_into_place() -> Result<()> {
         let (_output_dir, db_path) = build_small_database()?;
         assert_small_database(&db_path)
     }
