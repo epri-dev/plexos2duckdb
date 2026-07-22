@@ -11,27 +11,27 @@ documentation = "https://github.com/epri-dev/plexos2duckdb"
 readme = "README.md"
 
 [dependencies]
-chrono = "0.4.44"
-clap = { version = "4.6.1", features = ["derive"] }
+chrono = "0.4.45"
+clap = { version = "4.6.4", features = ["derive"] }
 color-eyre = "0.6.5"
-console = "0.16.3"
+console = "0.16.4"
 ctrlc = "3.5.2"
 dateparser = "0.3.1"
-duckdb = { version = "1.10502.0", features = ["bundled", "chrono", "appender-arrow"] }
+duckdb = { version = "1.10505.0", features = ["bundled", "chrono", "appender-arrow"] }
 indexmap = "2.14.0"
-indicatif = "0.18.4"
-itertools = "0.14.0"
+indicatif = "0.18.6"
+itertools = "0.15.0"
 lazy_static = "1.5.0"
 owo-colors = "4.3.0"
 parquet = { version = "58.2.0", default-features = false, features = ["arrow", "snap"] }
-regex = "1.12.3"
+regex = "1.13.1"
 roxmltree = "0.21.1"
 tempfile = "3.27.0"
 zip = "8.6.0"
-tabled = "0.20.0"
+tabled = "0.21.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-clap_complete = "4.6.3"
+clap_complete = "4.6.7"
 
 [profile.release]
 debug = "full"
