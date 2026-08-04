@@ -41,13 +41,16 @@ const EXPECTED_PROCESSED_PROPERTIES_COLUMNS: &[&str] = &[
     "unit",
 ];
 const EXPECTED_TIMESTAMP_BLOCK_COLUMNS: &[&str] = &["block_id", "datetime", "interval_length"];
-const EXPECTED_REPORT_PREFIX_COLUMNS: &[&str] = &[
+const EXPECTED_REPORT_COLUMNS: &[&str] = &[
     "band",
     "sample_name",
     "name",
     "category",
     "timestamp",
     "interval_length",
+    "property",
+    "value",
+    "unit",
 ];
 const EXPECTED_SCHEMAS: &[&str] = &["data", "main", "processed", "raw", "report"];
 const EXPECTED_RAW_TABLES: &[(&str, &[&str])] = &[
@@ -341,14 +344,12 @@ fn assert_columns_exact(actual: &[String], expected: &[&str], context: &str) {
     assert_eq!(actual, expected_vec, "unexpected columns for {context}");
 }
 
-fn assert_report_view_shape(con: &Connection, view_name: &str, metric_name: &str) {
+fn assert_report_view_shape(con: &Connection, view_name: &str, _metric_name: &str) {
     let columns = fetch_column_names(con, "report", view_name);
-    let mut expected = EXPECTED_REPORT_PREFIX_COLUMNS
+    let expected = EXPECTED_REPORT_COLUMNS
         .iter()
-        .map(|value| value.to_string())
+        .map(|v| v.to_string())
         .collect::<Vec<_>>();
-    expected.push(metric_name.to_string());
-    expected.push("unit".to_string());
     assert_eq!(
         columns, expected,
         "unexpected columns for report.{view_name}"
