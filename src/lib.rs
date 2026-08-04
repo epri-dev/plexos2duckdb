@@ -3884,7 +3884,8 @@ impl SolutionDataset {
                   m.child_name AS name,
                   m.child_category AS category,
                   {timestamp_select}
-                  d.value AS \"{property_name}\",
+                  '{property_name}' AS property,
+                  d.value AS value,
                   pr.unit AS unit,
                   FROM
                     data.\"{table_name}\" d
