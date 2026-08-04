@@ -91,7 +91,7 @@ def test_report_leaf_relation_has_expected_columns(
     relation = open_client.report.LT.Interval.Generators.Generation
     columns = list(relation.columns)
     # Columns are defined by ``create_report_views`` in ``src/lib.rs``.
-    for expected in ("band", "sample_name", "name", "category", "Generation", "unit"):
+    for expected in ("band", "sample_name", "name", "category", "value", "property", "unit"):
         assert expected in columns, columns
 
 
