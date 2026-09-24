@@ -1,0 +1,41 @@
+version: 2
+
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    allow:
+      - dependency-type: "all"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-patch"
+    commit-message:
+      prefix: "build"
+      include: "scope"
+
+  - package-ecosystem: "uv"
+    directory: "/python"
+    schedule:
+      interval: "weekly"
+    allow:
+      - dependency-type: "all"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-patch"
+    commit-message:
+      prefix: "build"
+      include: "scope"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    allow:
+      - dependency-type: "all"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-patch"
+    commit-message:
+      prefix: "build"
+      include: "scope"
