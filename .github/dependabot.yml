@@ -4,12 +4,19 @@ updates:
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
     allow:
-      - dependency-type: "all"
+      - dependency-type: "direct"
         update-types:
           - "version-update:semver-minor"
           - "version-update:semver-patch"
+    groups:
+      cargo-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
     commit-message:
       prefix: "build"
       include: "scope"
@@ -17,12 +24,19 @@ updates:
   - package-ecosystem: "uv"
     directory: "/python"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
     allow:
-      - dependency-type: "all"
+      - dependency-type: "direct"
         update-types:
           - "version-update:semver-minor"
           - "version-update:semver-patch"
+    groups:
+      python-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
     commit-message:
       prefix: "build"
       include: "scope"
@@ -30,12 +44,19 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
     allow:
-      - dependency-type: "all"
+      - dependency-type: "direct"
         update-types:
           - "version-update:semver-minor"
           - "version-update:semver-patch"
+    groups:
+      actions-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
     commit-message:
       prefix: "build"
       include: "scope"
